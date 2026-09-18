@@ -17,7 +17,7 @@ from homeassistant.components.media_player.browse_media import (
 
 from urllib.parse import urlparse
 from functools import partial
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageDraw, UnidentifiedImageError
 import numpy as np
 from homeassistant.helpers.network import get_url
 from homeassistant.exceptions import ServiceValidationError
@@ -36,6 +36,8 @@ class MediaProcessor:
         self.filenames = []
         self.snapshots_path = f"/media/{DOMAIN}/snapshots/"
         self.key_frame = ""
+        # Populated by stream_analyzer_pro when debug_polylines is enabled
+        self.debug_info = None
 
     async def _encode_image(self, img):
         """Encode image as base64"""
@@ -264,6 +266,190 @@ class MediaProcessor:
             f"{entity_prefix}Failed to fetch {url} after {max_retries} retries"
         )
 
+    @staticmethod
+    def _select_stream_frames(
+        image_entities, first_frames, frames_with_scores, max_frames
+    ):
+        """Select frames to analyze from captured stream frames.
+
+        Prepends the first frame of each camera, then fills with the
+        highest-movement frames. max_frames=None keeps every captured frame.
+        Returns a list of (frame_name, frame_bytes, score) tuples.
+        """
+        selected_frames = []
+        if max_frames is None:
+            remaining = len(image_entities) + len(frames_with_scores)
+        else:
+            remaining = max(0, max_frames)
+
+        # Prepend first frames in the order of requested entities
+        for entity in image_entities:
+            if remaining <= 0:
+                break
+            if entity in first_frames:
+                label, data = first_frames[entity]
+                selected_frames.append((label, data, None))
+                remaining -= 1
+
+        # Fill remaining slots with best scored frames, then restore capture order
+        best_rest = frames_with_scores[:remaining]
+        best_rest.sort(key=lambda x: (x[4], x[3]))
+        for name, data, score, _, _ in best_rest:
+            selected_frames.append((name, data, score))
+        return selected_frames
+
+    @staticmethod
+    def _compute_interval(duration, fps=None):
+        """Return the capture interval in seconds.
+
+        When fps is provided the interval is 1/fps; otherwise the legacy
+        duration-based cadence is used.
+        """
+        if fps:
+            try:
+                fps_value = float(fps)
+            except (TypeError, ValueError):
+                fps_value = 0
+            if fps_value > 0:
+                return 1.0 / fps_value
+        if duration is None or duration < 3:
+            return 1
+        elif duration < 10:
+            return 2
+        elif duration < 30:
+            return 3
+        else:
+            return 5
+
+    @staticmethod
+    def _validate_polylines(polylines):
+        """Validate and normalize polylines.
+
+        Each polyline is a list of at least two [x, y] points with x and y
+        normalized to the [0, 1] range. Returns a list of lists of (x, y)
+        float tuples, or None when no polylines are supplied.
+        """
+        if polylines is None:
+            return None
+        if not isinstance(polylines, (list, tuple)):
+            raise ServiceValidationError(
+                "polylines must be a list of polylines, each a list of [x, y] points"
+            )
+        normalized = []
+        for polyline in polylines:
+            if not isinstance(polyline, (list, tuple)) or len(polyline) < 2:
+                raise ServiceValidationError(
+                    "each polyline must be a list of at least two [x, y] points"
+                )
+            points = []
+            for point in polyline:
+                if not isinstance(point, (list, tuple)) or len(point) != 2:
+                    raise ServiceValidationError(
+                        "each polyline point must be an [x, y] pair"
+                    )
+                x, y = point
+                if isinstance(x, bool) or isinstance(y, bool):
+                    raise ServiceValidationError("polyline coordinates must be numbers")
+                try:
+                    x = float(x)
+                    y = float(y)
+                except (TypeError, ValueError):
+                    raise ServiceValidationError("polyline coordinates must be numbers")
+                if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+                    raise ServiceValidationError(
+                        "polyline coordinates must be normalized to the [0, 1] range"
+                    )
+                points.append((x, y))
+            normalized.append(points)
+        return normalized if normalized else None
+
+    def _resolve_storage_path(self, storage_path):
+        """Resolve and confine a caller-supplied storage directory.
+
+        Relative paths are placed under /media/<domain>/. Absolute paths must
+        resolve inside the Home Assistant media or config directory. Path
+        traversal outside those roots is rejected.
+        """
+        if not storage_path or not str(storage_path).strip():
+            raise ServiceValidationError("storage_path must not be empty")
+        raw = str(storage_path).strip()
+
+        media_root = os.path.realpath(f"/media")
+        allowed_roots = [media_root]
+        config_dir = getattr(self.hass.config, "config_dir", None)
+        if isinstance(config_dir, str) and config_dir:
+            allowed_roots.append(os.path.realpath(config_dir))
+
+        if os.path.isabs(raw):
+            candidate = os.path.realpath(raw)
+        else:
+            candidate = os.path.realpath(os.path.join(media_root, DOMAIN, raw))
+
+        if not any(
+            candidate == root or candidate.startswith(root + os.sep)
+            for root in allowed_roots
+        ):
+            raise ServiceValidationError(
+                "storage_path resolves outside the allowed media/config directory"
+            )
+        return candidate
+
+    async def _draw_polylines_on_image(self, image_data, target_width, polylines):
+        """Resize an image to target_width and draw red polylines on it.
+
+        Returns a tuple of (base64_jpeg, (width, height), resolved_polylines)
+        where resolved_polylines are the pixel coordinates actually drawn.
+        """
+
+        def _work():
+            img = Image.open(io.BytesIO(image_data))
+            img.load()
+            img = self._convert_to_rgb(img)
+            width, height = img.size
+            aspect_ratio = width / height
+            target_height = int(target_width / aspect_ratio)
+            if width > target_width or height > target_height:
+                img = img.resize((target_width, target_height))
+            w, h = img.size
+            resolved = []
+            if polylines:
+                draw = ImageDraw.Draw(img)
+                line_width = max(2, round(min(w, h) * 0.005))
+                for polyline in polylines:
+                    px_points = [
+                        (round(x * w), round(y * h)) for (x, y) in polyline
+                    ]
+                    resolved.append(px_points)
+                    draw.line(px_points, fill=(255, 0, 0), width=line_width)
+            buffer = io.BytesIO()
+            img.save(buffer, format="JPEG")
+            base64_image = base64.b64encode(buffer.getvalue()).decode("utf-8")
+            return base64_image, (w, h), resolved
+
+        return await self.hass.loop.run_in_executor(None, _work)
+
+    async def _write_snapshot(self, directory, filename, image_data):
+        """Write a snapshot (bytes or base64) into directory, returning the path."""
+        await self.hass.loop.run_in_executor(
+            None, partial(os.makedirs, directory, exist_ok=True)
+        )
+        path = os.path.join(directory, filename)
+
+        def _write():
+            with open(path, "wb") as handle:
+                if isinstance(image_data, bytes):
+                    handle.write(image_data)
+                else:
+                    handle.write(base64.b64decode(image_data))
+
+        try:
+            await self.hass.loop.run_in_executor(None, _write)
+        except OSError as err:
+            raise ServiceValidationError(
+                f"Failed to write snapshot to {path}: {err}"
+            )
+        return path
+
     async def record(
         self,
         image_entities,
@@ -272,6 +458,10 @@ class MediaProcessor:
         target_width,
         include_filename,
         expose_images,
+        fps=None,
+        polylines=None,
+        storage_path=None,
+        debug_polylines=False,
     ):
         """Wrapper for client.add_frame with integrated recorder
 
@@ -279,18 +469,19 @@ class MediaProcessor:
             image_entities (list[string]): List of camera entities to record
             duration (float): Duration in seconds to record
             target_width (int): Target width for the images in pixels
+            fps (float): Optional capture rate; overrides the duration cadence
+            polylines (list): Optional normalized polylines drawn in red on every
+                analyzed frame except the key frame
+            storage_path (str): Optional directory to persist analyzed snapshots
+            debug_polylines (bool): When True, collect polyline debug info and
+                persist annotated frames for inspection
         """
 
-        if duration is None or duration < 3:
-            interval = 1
-        elif duration < 10:
-            interval = 2
-        elif duration < 30:
-            interval = 3
-        elif duration < 60:
-            interval = 5
-        else:
-            interval = 5
+        polylines = self._validate_polylines(polylines)
+        resolved_storage = (
+            self._resolve_storage_path(storage_path) if storage_path else None
+        )
+        interval = self._compute_interval(duration, fps)
         camera_frames = {}
         first_frames = {}
         # Track successful image entities (cameras that successfully captured frames)
@@ -460,24 +651,10 @@ class MediaProcessor:
         # Sort frames by SSIM score
         frames_with_scores.sort(key=lambda x: x[2])
 
-        # Frame selection: prepend first frames, then best-scored (respect max_frames)
-        selected_frames = []
-        remaining = max(0, max_frames)
-
-        # Prepend first frames in the order of requested entities
-        for entity in image_entities:
-            if remaining <= 0:
-                break
-            if entity in first_frames:
-                label, data = first_frames[entity]
-                selected_frames.append((label, data, None))
-                remaining -= 1
-
-        # Fill remaining slots with best scored frames, then restore stable capture order
-        best_rest = frames_with_scores[:remaining]
-        best_rest.sort(key=lambda x: (x[4], x[3]))
-        for name, data, score, _, _ in best_rest:
-            selected_frames.append((name, data, score))
+        # Frame selection (respects max_frames; None means unbounded)
+        selected_frames = self._select_stream_frames(
+            image_entities, first_frames, frames_with_scores, max_frames
+        )
 
         # Add selected frames to client
         if selected_frames:
@@ -488,14 +665,57 @@ class MediaProcessor:
                 reference_bytes, candidate_bytes
             )
 
-            # Add all frames (resized) and expose only the chosen keyframe
+            debug_info = [] if debug_polylines else None
+            # Add all frames (resized). Draw polylines on every analyzed frame
+            # except the key frame, which stays clean for exposure and storage.
             resized_base64 = []
-            for frame_name, frame_data, _ in selected_frames:
-                resized_image = await self.resize_image(
-                    target_width=target_width, image_data=frame_data
-                )
+            for idx, (frame_name, frame_data, _) in enumerate(selected_frames):
+                if polylines and idx != key_idx:
+                    resized_image, (fw, fh), resolved = (
+                        await self._draw_polylines_on_image(
+                            image_data=frame_data,
+                            target_width=target_width,
+                            polylines=polylines,
+                        )
+                    )
+                    if debug_info is not None:
+                        debug_info.append(
+                            {
+                                "frame": frame_name,
+                                "width": fw,
+                                "height": fh,
+                                "polylines": resolved,
+                            }
+                        )
+                else:
+                    resized_image = await self.resize_image(
+                        target_width=target_width, image_data=frame_data
+                    )
                 resized_base64.append(resized_image)
                 self.client.add_frame(base64_image=resized_image, filename=frame_name)
+
+            if resolved_storage or debug_polylines:
+                stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+                for idx, (frame_name, _, _) in enumerate(selected_frames):
+                    safe_name = frame_name.replace("/", "_").replace("..", "_")
+                    filename = f"{safe_name}-{stamp}-{idx}.jpg"
+                    if resolved_storage:
+                        await self._write_snapshot(
+                            directory=resolved_storage,
+                            filename=filename,
+                            image_data=resized_base64[idx],
+                        )
+                    # In debug mode also persist annotated frames for inspection,
+                    # even when expose_images is off.
+                    if debug_polylines and polylines and idx != key_idx:
+                        await self._write_snapshot(
+                            directory=self.snapshots_path,
+                            filename=f"debug-{filename}",
+                            image_data=resized_base64[idx],
+                        )
+
+            if debug_info is not None:
+                self.debug_info = debug_info
 
             if expose_images:
                 key_name = selected_frames[key_idx][0]
@@ -960,6 +1180,10 @@ class MediaProcessor:
         target_width,
         include_filename,
         expose_images,
+        fps=None,
+        polylines=None,
+        storage_path=None,
+        debug_polylines=False,
     ):
         if image_entities:
             await self.record(
@@ -969,6 +1193,10 @@ class MediaProcessor:
                 target_width=target_width,
                 include_filename=include_filename,
                 expose_images=expose_images,
+                fps=fps,
+                polylines=polylines,
+                storage_path=storage_path,
+                debug_polylines=debug_polylines,
             )
         return self.client
 

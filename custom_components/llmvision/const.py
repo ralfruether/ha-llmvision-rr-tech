@@ -80,6 +80,13 @@ EXPOSE_IMAGES = "expose_images"
 GENERATE_TITLE = "generate_title"
 SENSOR_ENTITY = "sensor_entity"
 
+# stream_analyzer_pro service call constants
+FPS = "fps"
+POLYLINES = "polylines"
+STORAGE_PATH = "storage_path"
+REASONING_EFFORT = "reasoning_effort"
+DEBUG_POLYLINES = "debug_polylines"
+
 # Error messages
 ERROR_NOT_CONFIGURED = "{provider} is not configured"
 ERROR_GROQ_MULTIPLE_IMAGES = "Groq does not support videos or streams"

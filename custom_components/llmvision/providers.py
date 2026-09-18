@@ -478,6 +478,11 @@ class Provider(ABC):
             "think": config.get(CONF_THINK, False),
             "reasoning_effort": config.get(CONF_REASONING_EFFORT, "none"),
         }
+        # Per-call reasoning_effort (e.g. from stream_analyzer_pro) overrides the
+        # config-entry value; provider-specific clamping still applies downstream.
+        call_effort = getattr(call, "reasoning_effort", None)
+        if isinstance(call_effort, str) and call_effort and call_effort.lower() != "none":
+            default_parameters["reasoning_effort"] = call_effort
         if call.model_is_glimpse():
             default_parameters["temperature"] = 0.2
             default_parameters["top_p"] = 0.95

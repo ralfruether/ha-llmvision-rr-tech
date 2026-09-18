@@ -3,6 +3,7 @@
         "image_analyzer": "mdi:image-search",
         "video_analyzer": "mdi:movie-search",
         "stream_analyzer": "mdi:video-wireless",
+        "stream_analyzer_pro": "mdi:video-vintage",
         "data_analyzer": "mdi:database-search",
         "create_event": "mdi:timeline-plus-outline",
         "get_events": "mdi:timeline-text-outline"

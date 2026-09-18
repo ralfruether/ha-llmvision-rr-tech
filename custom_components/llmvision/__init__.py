@@ -57,6 +57,11 @@ from .const import (
     EXPOSE_IMAGES,
     GENERATE_TITLE,
     SENSOR_ENTITY,
+    FPS,
+    POLYLINES,
+    STORAGE_PATH,
+    REASONING_EFFORT,
+    DEBUG_POLYLINES,
     DATA_EXTRACTION_PROMPT,
     DEFAULT_OPENAI_MODEL,
     DEFAULT_ANTHROPIC_MODEL,
@@ -472,6 +477,9 @@ class ServiceCallData:
         self.interval: int = int(data_call.data.get(INTERVAL, 2))
         self.duration: int = int(data_call.data.get(DURATION, 10))
         self.max_frames: int = int(data_call.data.get(MAX_FRAMES, 3))
+        # Raw max_frames preserves "omitted" (None) so stream_analyzer_pro can treat
+        # it as unbounded instead of falling back to the default of 3.
+        self.max_frames_raw = data_call.data.get(MAX_FRAMES)
         self.target_width: int = data_call.data.get(TARGET_WIDTH, 3840)
         self.temperature: float = float()
         self.max_tokens: int = int(data_call.data.get(MAXTOKENS, 3000))
@@ -480,6 +488,12 @@ class ServiceCallData:
         self.generate_title: bool = data_call.data.get(GENERATE_TITLE, False)
         self.sensor_entity: str = data_call.data.get(SENSOR_ENTITY, "")
         self.response_format: str = data_call.data.get(RESPONSE_FORMAT, "text")
+        # stream_analyzer_pro options (unset for other services)
+        self.fps = data_call.data.get(FPS)
+        self.polylines = data_call.data.get(POLYLINES)
+        self.storage_path: str = data_call.data.get(STORAGE_PATH, "")
+        self.reasoning_effort = data_call.data.get(REASONING_EFFORT)
+        self.debug_polylines: bool = data_call.data.get(DEBUG_POLYLINES, False)
         self.structure: dict | None = data_call.data.get(STRUCTURE, None)
         self.title_field: str = data_call.data.get(TITLE_FIELD, "")
         self.description_field: str = data_call.data.get(DESCRIPTION_FIELD, "")
@@ -794,6 +808,57 @@ def setup(hass, config):
         )
         return response
 
+    async def stream_analyzer_pro(data_call):
+        """Handle the service call to analyze a stream with advanced options."""
+        start = dt_util.now()
+        call = ServiceCallData(data_call).get_service_call_data()
+        call.message = (
+            "The attached images are frames from a live camera feed. " + call.message
+        )
+        request = Request(
+            hass,
+            message=call.message,
+            max_tokens=call.max_tokens,
+            temperature=call.temperature,
+        )
+        processor = MediaProcessor(hass, request)
+
+        # Omitted max_frames means "analyze all captured frames" (unbounded)
+        max_frames = None if call.max_frames_raw is None else int(call.max_frames_raw)
+
+        request = await processor.add_streams(
+            image_entities=call.image_entities,
+            duration=call.duration,
+            max_frames=max_frames,
+            target_width=call.target_width,
+            include_filename=call.include_filename,
+            expose_images=call.expose_images,
+            fps=call.fps,
+            polylines=call.polylines,
+            storage_path=call.storage_path,
+            debug_polylines=call.debug_polylines,
+        )
+
+        call.memory = Memory(hass)
+        await call.memory._update_memory()
+
+        response = await request.call(call)
+        # Add processor.key_frame to response if it exists
+        if processor.key_frame:
+            response["key_frame"] = processor.key_frame
+        # Add polyline debug information if collected
+        if processor.debug_info is not None:
+            response["debug"] = processor.debug_info
+
+        await _create_event(
+            hass=hass,
+            call=call,  # type: ignore
+            start=start,
+            response=response,
+            key_frame=processor.key_frame,
+        )
+        return response
+
     async def data_analyzer(data_call):
         """Handle the service call to analyze visual data"""
         start = dt_util.now()
@@ -952,6 +1017,12 @@ def setup(hass, config):
         DOMAIN,
         "stream_analyzer",
         stream_analyzer,
+        supports_response=SupportsResponse.ONLY,
+    )
+    hass.services.register(
+        DOMAIN,
+        "stream_analyzer_pro",
+        stream_analyzer_pro,
         supports_response=SupportsResponse.ONLY,
     )
     hass.services.register(
