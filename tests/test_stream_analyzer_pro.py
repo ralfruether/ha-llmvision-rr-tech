@@ -303,3 +303,119 @@ class TestStreamAnalyzerProService:
             )
 
         assert "debug" not in result
+
+
+class TestAddVideosProWiring:
+    @pytest.mark.asyncio
+    async def test_validates_and_passes_pro_params(self, processor):
+        processor.add_video = AsyncMock()
+        with patch(
+            "custom_components.llmvision.media_handlers.get_url",
+            return_value="http://x",
+        ):
+            await processor.add_videos(
+                video_paths=["/config/a.mp4"],
+                event_ids=None,
+                max_frames=None,
+                target_width=1280,
+                include_filename=False,
+                expose_images=False,
+                fps=2,
+                polylines=[[[0.1, 0.5], [0.9, 0.5]]],
+                storage_path="recordings",
+                debug_polylines=True,
+            )
+        assert processor.debug_info == []
+        processor.add_video.assert_awaited_once()
+        kwargs = processor.add_video.await_args.kwargs
+        assert kwargs["fps"] == 2
+        assert kwargs["polylines"] == [[(0.1, 0.5), (0.9, 0.5)]]
+        assert kwargs["resolved_storage"] == os.path.realpath(
+            "/media/llmvision/recordings"
+        )
+        assert kwargs["debug_polylines"] is True
+
+    @pytest.mark.asyncio
+    async def test_invalid_polylines_raise(self, processor):
+        with patch(
+            "custom_components.llmvision.media_handlers.get_url",
+            return_value="http://x",
+        ):
+            with pytest.raises(ServiceValidationError):
+                await processor.add_videos(
+                    video_paths=["/config/a.mp4"],
+                    event_ids=None,
+                    max_frames=3,
+                    target_width=1280,
+                    include_filename=False,
+                    expose_images=False,
+                    polylines=[[[2.0, 0.5], [0.1, 0.2]]],
+                )
+
+    @pytest.mark.asyncio
+    async def test_traversal_storage_raises(self, processor):
+        with patch(
+            "custom_components.llmvision.media_handlers.get_url",
+            return_value="http://x",
+        ):
+            with pytest.raises(ServiceValidationError):
+                await processor.add_videos(
+                    video_paths=["/config/a.mp4"],
+                    event_ids=None,
+                    max_frames=3,
+                    target_width=1280,
+                    include_filename=False,
+                    expose_images=False,
+                    storage_path="../../etc",
+                )
+
+
+class TestVideoAnalyzerProService:
+    def _handlers(self, hass):
+        from custom_components.llmvision import setup
+
+        assert setup(hass, {}) is True
+        handlers = {}
+        for call in hass.services.register.call_args_list:
+            _, service_name, handler = call.args[:3]
+            handlers[service_name] = handler
+        return handlers
+
+    def test_service_registered(self):
+        hass = _make_hass()
+        handlers = self._handlers(hass)
+        assert "video_analyzer_pro" in handlers
+
+    @pytest.mark.asyncio
+    async def test_handler_returns_debug_and_key_frame(self):
+        hass = _make_hass()
+        handlers = self._handlers(hass)
+
+        call_obj = ServiceCallData(
+            _build_data_call({"provider": "e", "message": "m"})
+        )
+        request_obj = Mock()
+        request_obj.call = AsyncMock(return_value={"response_text": "ok"})
+        memory_obj = Mock()
+        memory_obj._update_memory = AsyncMock()
+        processor = Mock()
+        processor.key_frame = "frame.jpg"
+        processor.debug_info = [
+            {"frame": "clip frame 1", "width": 10, "height": 10, "polylines": []}
+        ]
+        processor.add_videos = AsyncMock(return_value=request_obj)
+
+        with (
+            patch("custom_components.llmvision.ServiceCallData", return_value=call_obj),
+            patch("custom_components.llmvision.Request", return_value=request_obj),
+            patch("custom_components.llmvision.MediaProcessor", return_value=processor),
+            patch("custom_components.llmvision.Memory", return_value=memory_obj),
+            patch("custom_components.llmvision._create_event", new=AsyncMock()),
+        ):
+            result = await handlers["video_analyzer_pro"](
+                _build_data_call({"provider": "e", "message": "m"})
+            )
+
+        assert result["key_frame"] == "frame.jpg"
+        assert result["debug"] == processor.debug_info
+

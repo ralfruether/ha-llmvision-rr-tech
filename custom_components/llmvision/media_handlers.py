@@ -835,6 +835,10 @@ class MediaProcessor:
         target_width=640,
         include_filename=False,
         expose_images=False,
+        fps=None,
+        polylines=None,
+        resolved_storage=None,
+        debug_polylines=False,
     ):
         try:
             current_event_id = str(uuid.uuid4())
@@ -861,9 +865,18 @@ class MediaProcessor:
 
                 video_path = base_url + video_path
 
+            # Sample at a fixed fps when requested, otherwise keep only I-frames
+            frame_filter = "select=eq(pict_type\\,I)"
+            if fps:
+                try:
+                    fps_value = float(fps)
+                except (TypeError, ValueError):
+                    fps_value = 0
+                if fps_value > 0:
+                    frame_filter = f"fps={fps_value}"
             ffmpeg_tail = [
                 "-vf",  # video filter
-                "select=eq(pict_type\\,I)",  # select only I-frames
+                frame_filter,
                 "-vsync",
                 "0",  # disable v-sync to avoid frame duplication
                 "-q:v",  # quality level for JPEG (lower is better)
@@ -1033,7 +1046,7 @@ class MediaProcessor:
                                 f"Cannot identify image from ffmpeg pipe at frame {frame_counter}"
                             )
                             continue
-                        if frame_counter >= max_frames:
+                        if max_frames is not None and frame_counter >= max_frames:
                             break
                 await ffmpeg_process.wait()
 
@@ -1086,9 +1099,13 @@ class MediaProcessor:
             # Sort scored frames by SSIM
             frames.sort(key=lambda x: x[1])
 
-            # Frame selection: prepend first frame, then best-scored (respect max_frames)
+            # Frame selection: prepend first frame, then best-scored.
+            # max_frames=None means unbounded: keep every extracted frame.
             selected_frames = []
-            remaining = max(0, max_frames)
+            if max_frames is None:
+                remaining = len(frames) + 1
+            else:
+                remaining = max(0, max_frames)
 
             if first_frame is not None and remaining > 0:
                 first_data, first_idx = first_frame
@@ -1100,30 +1117,76 @@ class MediaProcessor:
             best_rest.sort(key=lambda x: x[2])
             selected_frames.extend(best_rest)
 
-            # Add frames to client
-            resized_base64 = []
-            for idx, (frame_data, _, _) in enumerate(selected_frames, start=1):
-                resized_image = await self.resize_image(
-                    target_width=target_width, image_data=frame_data
-                )
-                resized_base64.append(resized_image)
-                self.client.add_frame(
-                    base64_image=resized_image,
-                    filename=(
-                        f"{os.path.splitext(os.path.basename(video_path))[0]} (frame {idx})"
-                        if include_filename
-                        else f"Video frame {idx}"
-                    ),
-                )
-
-            if expose_images and selected_frames:
-                # Expose keyframe if requested
+            # Determine the key frame up front when polylines/storage/debug/expose
+            # need it. The key frame stays clean (no polylines).
+            key_idx = None
+            if selected_frames and (
+                expose_images or polylines or resolved_storage or debug_polylines
+            ):
                 reference_bytes = selected_frames[0][0]
                 candidate_bytes = [fd for (fd, _, _) in selected_frames]
                 key_idx = await self._select_keyframe_index(
                     reference_bytes, candidate_bytes
                 )
-                # selected_frames items are (frame_bytes, score, original_index)
+
+            video_base = os.path.splitext(os.path.basename(video_path))[0]
+
+            # Add frames to client (polylines on every analyzed frame except key)
+            resized_base64 = []
+            for i, (frame_data, _, _) in enumerate(selected_frames):
+                idx = i + 1
+                if polylines and i != key_idx:
+                    resized_image, (fw, fh), resolved = (
+                        await self._draw_polylines_on_image(
+                            image_data=frame_data,
+                            target_width=target_width,
+                            polylines=polylines,
+                        )
+                    )
+                    if debug_polylines and self.debug_info is not None:
+                        self.debug_info.append(
+                            {
+                                "frame": f"{video_base} frame {idx}",
+                                "width": fw,
+                                "height": fh,
+                                "polylines": resolved,
+                            }
+                        )
+                else:
+                    resized_image = await self.resize_image(
+                        target_width=target_width, image_data=frame_data
+                    )
+                resized_base64.append(resized_image)
+                self.client.add_frame(
+                    base64_image=resized_image,
+                    filename=(
+                        f"{video_base} (frame {idx})"
+                        if include_filename
+                        else f"Video frame {idx}"
+                    ),
+                )
+
+            # Persist analyzed snapshots to disk if requested
+            if resolved_storage or debug_polylines:
+                stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+                safe_base = video_base.replace("/", "_").replace("..", "_")
+                for i in range(len(selected_frames)):
+                    filename = f"{safe_base}-{stamp}-{i}.jpg"
+                    if resolved_storage:
+                        await self._write_snapshot(
+                            directory=resolved_storage,
+                            filename=filename,
+                            image_data=resized_base64[i],
+                        )
+                    if debug_polylines and polylines and i != key_idx:
+                        await self._write_snapshot(
+                            directory=self.snapshots_path,
+                            filename=f"debug-{filename}",
+                            image_data=resized_base64[i],
+                        )
+
+            if expose_images and selected_frames and key_idx is not None:
+                # Expose the clean key frame
                 frame_idx_label = (selected_frames[key_idx][2] or 0) + 1
                 await self._expose_image(
                     frame_name=str(frame_idx_label),
@@ -1141,6 +1204,10 @@ class MediaProcessor:
         target_width,
         include_filename,
         expose_images,
+        fps=None,
+        polylines=None,
+        storage_path=None,
+        debug_polylines=False,
     ):
         """Wrapper for client.add_frame for videos"""
 
@@ -1157,6 +1224,14 @@ class MediaProcessor:
 
         _LOGGER.debug(f"Processing videos: {video_paths}")
 
+        # Validate/resolve pro options once for all videos
+        polylines = self._validate_polylines(polylines)
+        resolved_storage = (
+            self._resolve_storage_path(storage_path) if storage_path else None
+        )
+        if debug_polylines:
+            self.debug_info = []
+
         def process_video(video_path):
             return self.add_video(
                 video_path=video_path,
@@ -1165,6 +1240,10 @@ class MediaProcessor:
                 target_width=target_width,
                 include_filename=include_filename,
                 expose_images=expose_images,
+                fps=fps,
+                polylines=polylines,
+                resolved_storage=resolved_storage,
+                debug_polylines=debug_polylines,
             )
 
         # Process videos in parallel

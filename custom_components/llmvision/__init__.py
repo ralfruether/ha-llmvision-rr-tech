@@ -767,6 +767,55 @@ def setup(hass, config):
         )
         return response
 
+    async def video_analyzer_pro(data_call):
+        """Handle the service call to analyze a video with advanced options."""
+        start = dt_util.now()
+        call = ServiceCallData(data_call).get_service_call_data()
+        call.message = "The attached images are frames from a video. " + call.message
+
+        request = Request(
+            hass,
+            message=call.message,
+            max_tokens=call.max_tokens,
+            temperature=call.temperature,
+        )
+        processor = MediaProcessor(hass, request)
+
+        # Omitted max_frames means "analyze all extracted frames" (unbounded)
+        max_frames = None if call.max_frames_raw is None else int(call.max_frames_raw)
+
+        request = await processor.add_videos(
+            video_paths=call.video_paths,
+            event_ids=call.event_id,
+            max_frames=max_frames,
+            target_width=call.target_width,
+            include_filename=call.include_filename,
+            expose_images=call.expose_images,
+            fps=call.fps,
+            polylines=call.polylines,
+            storage_path=call.storage_path,
+            debug_polylines=call.debug_polylines,
+        )
+        call.memory = Memory(hass)
+        await call.memory._update_memory()
+
+        response = await request.call(call)
+        # Add processor.key_frame to response if it exists
+        if processor.key_frame:
+            response["key_frame"] = processor.key_frame
+        # Add polyline debug information if collected
+        if processor.debug_info is not None:
+            response["debug"] = processor.debug_info
+
+        await _create_event(
+            hass=hass,
+            call=call,  # type: ignore
+            start=start,
+            response=response,
+            key_frame=processor.key_frame,
+        )
+        return response
+
     async def stream_analyzer(data_call):
         """Handle the service call to analyze a stream"""
         start = dt_util.now()
@@ -1011,6 +1060,12 @@ def setup(hass, config):
         DOMAIN,
         "video_analyzer",
         video_analyzer,
+        supports_response=SupportsResponse.ONLY,
+    )
+    hass.services.register(
+        DOMAIN,
+        "video_analyzer_pro",
+        video_analyzer_pro,
         supports_response=SupportsResponse.ONLY,
     )
     hass.services.register(
