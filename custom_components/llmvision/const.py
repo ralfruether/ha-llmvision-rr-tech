@@ -86,6 +86,8 @@ POLYLINES = "polylines"
 STORAGE_PATH = "storage_path"
 REASONING_EFFORT = "reasoning_effort"
 DEBUG_POLYLINES = "debug_polylines"
+CLIP_PATH = "clip_path"
+RECORD_FPS = "record_fps"
 
 # Error messages
 ERROR_NOT_CONFIGURED = "{provider} is not configured"

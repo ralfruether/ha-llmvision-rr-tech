@@ -62,6 +62,8 @@ from .const import (
     STORAGE_PATH,
     REASONING_EFFORT,
     DEBUG_POLYLINES,
+    CLIP_PATH,
+    RECORD_FPS,
     DATA_EXTRACTION_PROMPT,
     DEFAULT_OPENAI_MODEL,
     DEFAULT_ANTHROPIC_MODEL,
@@ -494,6 +496,8 @@ class ServiceCallData:
         self.storage_path: str = data_call.data.get(STORAGE_PATH, "")
         self.reasoning_effort = data_call.data.get(REASONING_EFFORT)
         self.debug_polylines: bool = data_call.data.get(DEBUG_POLYLINES, False)
+        self.clip_path: str = data_call.data.get(CLIP_PATH, "")
+        self.record_fps = data_call.data.get(RECORD_FPS)
         self.structure: dict | None = data_call.data.get(STRUCTURE, None)
         self.title_field: str = data_call.data.get(TITLE_FIELD, "")
         self.description_field: str = data_call.data.get(DESCRIPTION_FIELD, "")
@@ -886,6 +890,8 @@ def setup(hass, config):
             polylines=call.polylines,
             storage_path=call.storage_path,
             debug_polylines=call.debug_polylines,
+            clip_path=call.clip_path,
+            record_fps=call.record_fps,
         )
 
         call.memory = Memory(hass)
@@ -898,6 +904,13 @@ def setup(hass, config):
         # Add polyline debug information if collected
         if processor.debug_info is not None:
             response["debug"] = processor.debug_info
+        # Add recorded clip path(s) if any
+        if processor.clip_paths:
+            response["clip"] = (
+                processor.clip_paths[0]
+                if len(processor.clip_paths) == 1
+                else processor.clip_paths
+            )
 
         await _create_event(
             hass=hass,

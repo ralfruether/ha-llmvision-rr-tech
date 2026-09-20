@@ -744,6 +744,25 @@ stream_analyzer_pro:
       default: false
       selector:
         boolean:
+    clip_path:
+      name: Clip Path
+      required: false
+      description: 'Full path (including filename) for a recorded video clip of the live stream, captured independently of the analyzed snapshots and transcoded to a fluent H.264 mp4. Relative paths are stored under /media/llmvision/. Absolute paths must resolve inside the Home Assistant media or config directory. With multiple cameras, the camera name is inserted before the extension.'
+      example: '/media/llmvision/clips/front_door.mp4'
+      selector:
+        text:
+    record_fps:
+      name: Recording FPS
+      required: false
+      description: 'Frame rate for the recorded clip (independent of the analysis fps). Defaults to 15.'
+      example: 15
+      default: 15
+      selector:
+        number:
+          min: 1
+          max: 60
+          step: 1
+          mode: box
     include_filename:
       name: Include camera name
       required: true

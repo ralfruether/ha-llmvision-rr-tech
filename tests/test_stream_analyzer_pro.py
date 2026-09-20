@@ -258,6 +258,7 @@ class TestStreamAnalyzerProService:
         processor = Mock()
         processor.key_frame = "frame.jpg"
         processor.debug_info = [{"frame": "f", "width": 10, "height": 10, "polylines": []}]
+        processor.clip_paths = []
         processor.add_streams = AsyncMock(return_value=request_obj)
 
         with (
@@ -289,6 +290,7 @@ class TestStreamAnalyzerProService:
         processor = Mock()
         processor.key_frame = ""
         processor.debug_info = None
+        processor.clip_paths = []
         processor.add_streams = AsyncMock(return_value=request_obj)
 
         with (
@@ -418,4 +420,165 @@ class TestVideoAnalyzerProService:
 
         assert result["key_frame"] == "frame.jpg"
         assert result["debug"] == processor.debug_info
+
+
+class TestClipRecording:
+    def test_resolve_output_file_relative(self, processor):
+        assert processor._resolve_output_file("clips/a.mp4") == os.path.realpath(
+            "/media/llmvision/clips/a.mp4"
+        )
+
+    def test_resolve_output_file_traversal_raises(self, processor):
+        with pytest.raises(ServiceValidationError):
+            processor._resolve_output_file("../../etc/x.mp4")
+
+    def test_resolve_output_file_empty_raises(self, processor):
+        with pytest.raises(ServiceValidationError):
+            processor._resolve_output_file("")
+
+    def test_resolve_output_file_absolute_inside_config(self, processor, tmp_path):
+        processor.hass.config.config_dir = str(tmp_path)
+        target = str(tmp_path / "clips" / "a.mp4")
+        assert processor._resolve_output_file(target) == os.path.realpath(target)
+
+    def test_suffix_path(self, processor):
+        assert (
+            processor._suffix_path("/media/llmvision/clips/a.mp4", "camera.front_door")
+            == "/media/llmvision/clips/a-front_door.mp4"
+        )
+
+    def test_build_clip_ffmpeg_cmd(self, processor):
+        cmd = processor._build_clip_ffmpeg_cmd(
+            "rtsp://x", 5, 15, "/media/llmvision/clips/a.mp4"
+        )
+        assert cmd[0] == "ffmpeg"
+        assert "libx264" in cmd
+        assert "fps=15,format=yuv420p" in cmd
+        assert "+faststart" in cmd
+        assert "rtsp://x" in cmd
+        assert cmd[-1] == "/media/llmvision/clips/a.mp4"
+        # duration passed via -t
+        assert cmd[cmd.index("-t") + 1] == "5"
+
+    @pytest.mark.asyncio
+    async def test_record_clip_no_stream_source_is_skipped(self, processor, tmp_path):
+        out = str(tmp_path / "clip.mp4")
+        with patch(
+            "custom_components.llmvision.media_handlers._async_get_stream_source",
+            AsyncMock(return_value=None),
+        ):
+            result = await processor.record_clip(["camera.front"], 5, out)
+        assert result == []
+        assert processor.clip_paths == []
+
+    @pytest.mark.asyncio
+    async def test_record_clip_success(self, processor, tmp_path):
+        out = str(tmp_path / "clip.mp4")
+
+        async def _communicate():
+            with open(out, "wb") as handle:
+                handle.write(b"video")
+            return (b"", b"")
+
+        proc = Mock()
+        proc.communicate = _communicate
+        proc.returncode = 0
+
+        with (
+            patch(
+                "custom_components.llmvision.media_handlers._async_get_stream_source",
+                AsyncMock(return_value="rtsp://x"),
+            ),
+            patch(
+                "custom_components.llmvision.media_handlers.asyncio.create_subprocess_exec",
+                AsyncMock(return_value=proc),
+            ),
+        ):
+            result = await processor.record_clip(["camera.front"], 5, out, record_fps=15)
+        assert result == [out]
+        assert processor.clip_paths == [out]
+
+    @pytest.mark.asyncio
+    async def test_add_streams_runs_record_clip(self, processor):
+        processor.record = AsyncMock()
+        processor.record_clip = AsyncMock()
+        await processor.add_streams(
+            image_entities=["camera.a"],
+            duration=5,
+            max_frames=3,
+            target_width=1280,
+            include_filename=False,
+            expose_images=False,
+            clip_path="clips/a.mp4",
+            record_fps=15,
+        )
+        processor.record_clip.assert_awaited_once()
+        kwargs = processor.record_clip.await_args.kwargs
+        assert kwargs["resolved_path"] == os.path.realpath(
+            "/media/llmvision/clips/a.mp4"
+        )
+        assert kwargs["record_fps"] == 15
+
+    @pytest.mark.asyncio
+    async def test_add_streams_invalid_clip_path_raises(self, processor):
+        processor.record = AsyncMock()
+        with pytest.raises(ServiceValidationError):
+            await processor.add_streams(
+                image_entities=["camera.a"],
+                duration=5,
+                max_frames=3,
+                target_width=1280,
+                include_filename=False,
+                expose_images=False,
+                clip_path="../../etc/x.mp4",
+            )
+
+    @pytest.mark.asyncio
+    async def test_add_streams_without_clip_skips_record_clip(self, processor):
+        processor.record = AsyncMock()
+        processor.record_clip = AsyncMock()
+        await processor.add_streams(
+            image_entities=["camera.a"],
+            duration=5,
+            max_frames=3,
+            target_width=1280,
+            include_filename=False,
+            expose_images=False,
+        )
+        processor.record_clip.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stream_handler_returns_clip(self):
+        hass = _make_hass()
+        from custom_components.llmvision import setup
+
+        assert setup(hass, {}) is True
+        handlers = {}
+        for call in hass.services.register.call_args_list:
+            _, service_name, handler = call.args[:3]
+            handlers[service_name] = handler
+
+        call_obj = ServiceCallData(_build_data_call({"provider": "e", "message": "m"}))
+        request_obj = Mock()
+        request_obj.call = AsyncMock(return_value={"response_text": "ok"})
+        memory_obj = Mock()
+        memory_obj._update_memory = AsyncMock()
+        processor = Mock()
+        processor.key_frame = ""
+        processor.debug_info = None
+        processor.clip_paths = ["/media/llmvision/clips/a.mp4"]
+        processor.add_streams = AsyncMock(return_value=request_obj)
+
+        with (
+            patch("custom_components.llmvision.ServiceCallData", return_value=call_obj),
+            patch("custom_components.llmvision.Request", return_value=request_obj),
+            patch("custom_components.llmvision.MediaProcessor", return_value=processor),
+            patch("custom_components.llmvision.Memory", return_value=memory_obj),
+            patch("custom_components.llmvision._create_event", new=AsyncMock()),
+        ):
+            result = await handlers["stream_analyzer_pro"](
+                _build_data_call({"provider": "e", "message": "m"})
+            )
+
+        assert result["clip"] == "/media/llmvision/clips/a.mp4"
 

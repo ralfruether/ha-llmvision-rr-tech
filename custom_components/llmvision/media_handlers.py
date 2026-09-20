@@ -27,6 +27,17 @@ from .const import DOMAIN
 _LOGGER = logging.getLogger(__name__)
 
 
+async def _async_get_stream_source(hass, entity_id):
+    """Lazily resolve a camera's stream source.
+
+    Imported on demand so the camera component (and its heavy optional deps) is
+    only loaded when a clip is actually recorded.
+    """
+    from homeassistant.components.camera import async_get_stream_source
+
+    return await async_get_stream_source(hass, entity_id)
+
+
 class MediaProcessor:
     def __init__(self, hass, client):
         self.hass = hass
@@ -38,6 +49,8 @@ class MediaProcessor:
         self.key_frame = ""
         # Populated by stream_analyzer_pro when debug_polylines is enabled
         self.debug_info = None
+        # Populated by stream_analyzer_pro when a clip is recorded
+        self.clip_paths = []
 
     async def _encode_image(self, img):
         """Encode image as base64"""
@@ -393,6 +406,149 @@ class MediaProcessor:
                 "storage_path resolves outside the allowed media/config directory"
             )
         return candidate
+
+    def _resolve_output_file(self, path):
+        """Resolve and confine a caller-supplied output file path.
+
+        Relative paths are placed under /media/<domain>/. Absolute paths must
+        resolve inside the Home Assistant media or config directory. Path
+        traversal outside those roots is rejected.
+        """
+        if not path or not str(path).strip():
+            raise ServiceValidationError("clip_path must not be empty")
+        raw = str(path).strip()
+
+        media_root = os.path.realpath(f"/media")
+        allowed_roots = [media_root]
+        config_dir = getattr(self.hass.config, "config_dir", None)
+        if isinstance(config_dir, str) and config_dir:
+            allowed_roots.append(os.path.realpath(config_dir))
+
+        if os.path.isabs(raw):
+            candidate = os.path.realpath(raw)
+        else:
+            candidate = os.path.realpath(os.path.join(media_root, DOMAIN, raw))
+
+        if not any(
+            candidate == root or candidate.startswith(root + os.sep)
+            for root in allowed_roots
+        ):
+            raise ServiceValidationError(
+                "clip_path resolves outside the allowed media/config directory"
+            )
+        return candidate
+
+    @staticmethod
+    def _suffix_path(path, camera_entity):
+        """Insert a camera name before the extension for multi-camera clips."""
+        stem, ext = os.path.splitext(path)
+        safe = camera_entity.replace("camera.", "").replace("/", "_")
+        return f"{stem}-{safe}{ext}"
+
+    @staticmethod
+    def _build_clip_ffmpeg_cmd(stream_url, duration, record_fps, out_path):
+        """Build the ffmpeg command to transcode a stream to a fluent H.264 mp4.
+
+        Forces a constant frame rate (fps filter) to smooth variable-bitrate
+        H.265 sources and outputs yuv420p H.264 for broad device playback.
+        """
+        return [
+            "ffmpeg",
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-rtsp_transport",
+            "tcp",
+            "-i",
+            stream_url,
+            "-t",
+            str(duration),
+            "-an",
+            "-sn",
+            "-dn",
+            "-vf",
+            f"fps={record_fps},format=yuv420p",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-profile:v",
+            "high",
+            "-level",
+            "4.1",
+            "-crf",
+            "23",
+            "-movflags",
+            "+faststart",
+            "-y",
+            out_path,
+        ]
+
+    async def record_clip(self, image_entities, duration, resolved_path, record_fps=15):
+        """Record each camera's live stream to a fluent H.264 mp4.
+
+        Runs independently of the snapshot analysis. A camera without a stream
+        source or a failed transcode is skipped (logged), not fatal. Returns the
+        list of written clip paths.
+        """
+        entities = list(image_entities or [])
+        written = []
+        for camera_entity in entities:
+            out_path = (
+                resolved_path
+                if len(entities) == 1
+                else self._suffix_path(resolved_path, camera_entity)
+            )
+            try:
+                stream_url = await _async_get_stream_source(self.hass, camera_entity)
+            except Exception as err:
+                _LOGGER.warning(
+                    f"Could not get stream source for {camera_entity}: {err}"
+                )
+                continue
+            if not stream_url:
+                _LOGGER.warning(
+                    f"Camera {camera_entity} has no stream source; skipping clip"
+                )
+                continue
+
+            await self.hass.loop.run_in_executor(
+                None,
+                partial(os.makedirs, os.path.dirname(out_path), exist_ok=True),
+            )
+            cmd = self._build_clip_ffmpeg_cmd(
+                stream_url, duration, record_fps, out_path
+            )
+            _LOGGER.debug(f"Recording clip: {' '.join(cmd)}")
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                try:
+                    _, stderr = await asyncio.wait_for(
+                        proc.communicate(), timeout=float(duration) + 30
+                    )
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    _LOGGER.error(f"Clip recording for {camera_entity} timed out")
+                    continue
+                if proc.returncode == 0 and os.path.exists(out_path):
+                    written.append(out_path)
+                else:
+                    detail = (
+                        stderr.decode(errors="ignore") if stderr else "unknown error"
+                    )
+                    _LOGGER.error(
+                        f"Clip recording failed for {camera_entity}: {detail}"
+                    )
+            except Exception as err:
+                _LOGGER.error(f"Clip recording error for {camera_entity}: {err}")
+
+        self.clip_paths = written
+        return written
 
     async def _draw_polylines_on_image(self, image_data, target_width, polylines):
         """Resize an image to target_width and draw red polylines on it.
@@ -1263,20 +1419,39 @@ class MediaProcessor:
         polylines=None,
         storage_path=None,
         debug_polylines=False,
+        clip_path=None,
+        record_fps=15,
     ):
         if image_entities:
-            await self.record(
-                image_entities=image_entities,
-                duration=duration,
-                max_frames=max_frames,
-                target_width=target_width,
-                include_filename=include_filename,
-                expose_images=expose_images,
-                fps=fps,
-                polylines=polylines,
-                storage_path=storage_path,
-                debug_polylines=debug_polylines,
+            # Resolve/confine the clip path before recording so a bad path fails
+            # fast without cancelling the snapshot capture.
+            resolved_clip = (
+                self._resolve_output_file(clip_path) if clip_path else None
             )
+            tasks = [
+                self.record(
+                    image_entities=image_entities,
+                    duration=duration,
+                    max_frames=max_frames,
+                    target_width=target_width,
+                    include_filename=include_filename,
+                    expose_images=expose_images,
+                    fps=fps,
+                    polylines=polylines,
+                    storage_path=storage_path,
+                    debug_polylines=debug_polylines,
+                )
+            ]
+            if resolved_clip is not None:
+                tasks.append(
+                    self.record_clip(
+                        image_entities=image_entities,
+                        duration=duration,
+                        resolved_path=resolved_clip,
+                        record_fps=record_fps or 15,
+                    )
+                )
+            await asyncio.gather(*tasks)
         return self.client
 
     async def add_visual_data(
