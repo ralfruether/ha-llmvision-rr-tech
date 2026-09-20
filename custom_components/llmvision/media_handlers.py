@@ -449,17 +449,23 @@ class MediaProcessor:
     def _build_clip_ffmpeg_cmd(stream_url, duration, record_fps, out_path):
         """Build the ffmpeg command to transcode a stream to a fluent H.264 mp4.
 
-        Forces a constant frame rate (fps filter) to smooth variable-bitrate
-        H.265 sources and outputs yuv420p H.264 for broad device playback.
+        Regenerates timestamps from real arrival time so the constant-frame-rate
+        resampling is even (jittery camera PTS otherwise cause judder), then
+        outputs yuv420p H.264 for broad device playback.
         """
         return [
             "ffmpeg",
             "-nostdin",
             "-hide_banner",
             "-loglevel",
-            "error",
+            "warning",
             "-rtsp_transport",
             "tcp",
+            # Stamp incoming frames by arrival time for an even resampling clock
+            "-use_wallclock_as_timestamps",
+            "1",
+            "-fflags",
+            "+genpts",
             "-i",
             stream_url,
             "-t",
@@ -468,11 +474,13 @@ class MediaProcessor:
             "-sn",
             "-dn",
             "-vf",
-            f"fps={record_fps},format=yuv420p",
+            f"fps={record_fps}",
             "-c:v",
             "libx264",
             "-preset",
             "veryfast",
+            "-pix_fmt",
+            "yuv420p",
             "-profile:v",
             "high",
             "-level",
@@ -481,6 +489,8 @@ class MediaProcessor:
             "23",
             "-movflags",
             "+faststart",
+            "-avoid_negative_ts",
+            "make_zero",
             "-y",
             out_path,
         ]

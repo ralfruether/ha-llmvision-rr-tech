@@ -453,12 +453,19 @@ class TestClipRecording:
         )
         assert cmd[0] == "ffmpeg"
         assert "libx264" in cmd
-        assert "fps=15,format=yuv420p" in cmd
+        assert "fps=15" in cmd
+        assert "yuv420p" in cmd
         assert "+faststart" in cmd
         assert "rtsp://x" in cmd
+        # even resampling clock from arrival time (fixes judder)
+        assert "-use_wallclock_as_timestamps" in cmd
+        assert cmd[cmd.index("-use_wallclock_as_timestamps") + 1] == "1"
+        assert "+genpts" in cmd
         assert cmd[-1] == "/media/llmvision/clips/a.mp4"
         # duration passed via -t
         assert cmd[cmd.index("-t") + 1] == "5"
+        # timestamp/pixfmt options must precede the input / be output options correctly
+        assert cmd.index("-use_wallclock_as_timestamps") < cmd.index("-i")
 
     @pytest.mark.asyncio
     async def test_record_clip_no_stream_source_is_skipped(self, processor, tmp_path):
