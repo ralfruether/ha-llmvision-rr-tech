@@ -446,14 +446,25 @@ class MediaProcessor:
         return f"{stem}-{safe}{ext}"
 
     @staticmethod
-    def _build_clip_ffmpeg_cmd(stream_url, duration, record_fps, out_path):
-        """Build the ffmpeg command to transcode a stream to a fluent H.264 mp4.
+    def _build_clip_ffmpeg_cmd(
+        stream_url, duration, record_fps, out_path, scale_width=1920
+    ):
+        """Build the ffmpeg command to transcode a stream to a phone-friendly mp4.
 
-        Regenerates timestamps from real arrival time so the constant-frame-rate
-        resampling is even (jittery camera PTS otherwise cause judder), then
-        outputs yuv420p H.264 for broad device playback.
+        Downscales oversized streams (never upscales), lets libx264 pick the
+        correct H.264 level for the resolution, and uses a short keyframe
+        interval so playback decodes smoothly. Frame timing is preserved
+        (native) unless a record_fps is given to force a constant rate.
         """
-        return [
+        filters = []
+        if scale_width and int(scale_width) > 0:
+            # Cap width, keep aspect (even height); min() avoids upscaling
+            filters.append(f"scale='min({int(scale_width)},iw)':-2")
+        if record_fps:
+            filters.append(f"fps={record_fps}")
+        gop = int((record_fps or 15) * 2)
+
+        cmd = [
             "ffmpeg",
             "-nostdin",
             "-hide_banner",
@@ -461,11 +472,6 @@ class MediaProcessor:
             "warning",
             "-rtsp_transport",
             "tcp",
-            # Stamp incoming frames by arrival time for an even resampling clock
-            "-use_wallclock_as_timestamps",
-            "1",
-            "-fflags",
-            "+genpts",
             "-i",
             stream_url,
             "-t",
@@ -473,8 +479,10 @@ class MediaProcessor:
             "-an",
             "-sn",
             "-dn",
-            "-vf",
-            f"fps={record_fps}",
+        ]
+        if filters:
+            cmd += ["-vf", ",".join(filters)]
+        cmd += [
             "-c:v",
             "libx264",
             "-preset",
@@ -483,10 +491,8 @@ class MediaProcessor:
             "yuv420p",
             "-profile:v",
             "high",
-            "-level",
-            "4.1",
-            "-crf",
-            "23",
+            "-g",
+            str(gop),
             "-movflags",
             "+faststart",
             "-avoid_negative_ts",
@@ -494,8 +500,11 @@ class MediaProcessor:
             "-y",
             out_path,
         ]
+        return cmd
 
-    async def record_clip(self, image_entities, duration, resolved_path, record_fps=15):
+    async def record_clip(
+        self, image_entities, duration, resolved_path, record_fps=None, scale_width=1920
+    ):
         """Record each camera's live stream to a fluent H.264 mp4.
 
         Runs independently of the snapshot analysis. A camera without a stream
@@ -528,7 +537,7 @@ class MediaProcessor:
                 partial(os.makedirs, os.path.dirname(out_path), exist_ok=True),
             )
             cmd = self._build_clip_ffmpeg_cmd(
-                stream_url, duration, record_fps, out_path
+                stream_url, duration, record_fps, out_path, scale_width
             )
             _LOGGER.debug(f"Recording clip: {' '.join(cmd)}")
             try:
@@ -1430,7 +1439,8 @@ class MediaProcessor:
         storage_path=None,
         debug_polylines=False,
         clip_path=None,
-        record_fps=15,
+        record_fps=None,
+        record_scale=None,
     ):
         if image_entities:
             # Resolve/confine the clip path before recording so a bad path fails
@@ -1453,12 +1463,15 @@ class MediaProcessor:
                 )
             ]
             if resolved_clip is not None:
+                # Default to a 1080p cap unless the caller sets record_scale (0 = native)
+                scale_width = 1920 if record_scale is None else int(record_scale)
                 tasks.append(
                     self.record_clip(
                         image_entities=image_entities,
                         duration=duration,
                         resolved_path=resolved_clip,
-                        record_fps=record_fps or 15,
+                        record_fps=record_fps,
+                        scale_width=scale_width,
                     )
                 )
             await asyncio.gather(*tasks)

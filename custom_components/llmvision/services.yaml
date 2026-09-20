@@ -754,14 +754,25 @@ stream_analyzer_pro:
     record_fps:
       name: Recording FPS
       required: false
-      description: 'Frame rate for the recorded clip (independent of the analysis fps). Defaults to 15.'
+      description: 'Force a constant frame rate for the recorded clip (independent of the analysis fps). Leave empty to keep the camera''s native frame timing (recommended).'
       example: 15
-      default: 15
       selector:
         number:
           min: 1
           max: 60
           step: 1
+          mode: box
+    record_scale:
+      name: Recording Width
+      required: false
+      description: 'Downscale the recorded clip to this width (keeps aspect ratio, never upscales). Improves phone playback and file size. Defaults to 1920 (1080p). Set to 0 to keep the camera''s native resolution.'
+      example: 1920
+      default: 1920
+      selector:
+        number:
+          min: 0
+          max: 3840
+          step: 2
           mode: box
     include_filename:
       name: Include camera name

@@ -88,6 +88,7 @@ REASONING_EFFORT = "reasoning_effort"
 DEBUG_POLYLINES = "debug_polylines"
 CLIP_PATH = "clip_path"
 RECORD_FPS = "record_fps"
+RECORD_SCALE = "record_scale"
 
 # Error messages
 ERROR_NOT_CONFIGURED = "{provider} is not configured"

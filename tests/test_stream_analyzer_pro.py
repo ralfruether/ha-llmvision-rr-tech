@@ -449,23 +449,34 @@ class TestClipRecording:
 
     def test_build_clip_ffmpeg_cmd(self, processor):
         cmd = processor._build_clip_ffmpeg_cmd(
-            "rtsp://x", 5, 15, "/media/llmvision/clips/a.mp4"
+            "rtsp://x", 5, 15, "/media/llmvision/clips/a.mp4", 1920
         )
         assert cmd[0] == "ffmpeg"
         assert "libx264" in cmd
-        assert "fps=15" in cmd
         assert "yuv420p" in cmd
         assert "+faststart" in cmd
         assert "rtsp://x" in cmd
-        # even resampling clock from arrival time (fixes judder)
-        assert "-use_wallclock_as_timestamps" in cmd
-        assert cmd[cmd.index("-use_wallclock_as_timestamps") + 1] == "1"
-        assert "+genpts" in cmd
         assert cmd[-1] == "/media/llmvision/clips/a.mp4"
         # duration passed via -t
         assert cmd[cmd.index("-t") + 1] == "5"
-        # timestamp/pixfmt options must precede the input / be output options correctly
-        assert cmd.index("-use_wallclock_as_timestamps") < cmd.index("-i")
+        # correct level must be chosen by x264, not hardcoded to a wrong value
+        assert "-level" not in cmd
+        # short keyframe interval for smooth decode
+        assert "-g" in cmd
+        assert cmd[cmd.index("-g") + 1] == "30"
+        # downscale cap (never upscales), and forced fps when given
+        vf = cmd[cmd.index("-vf") + 1]
+        assert "scale='min(1920,iw)':-2" in vf
+        assert "fps=15" in vf
+
+    def test_build_clip_ffmpeg_cmd_native(self, processor):
+        # No record_fps and scale 0 => passthrough timing, native resolution
+        cmd = processor._build_clip_ffmpeg_cmd(
+            "rtsp://x", 5, None, "/out.mp4", 0
+        )
+        assert "-vf" not in cmd
+        assert "fps=" not in " ".join(cmd)
+        assert "-g" in cmd  # keyframe interval still set (default 30)
 
     @pytest.mark.asyncio
     async def test_record_clip_no_stream_source_is_skipped(self, processor, tmp_path):

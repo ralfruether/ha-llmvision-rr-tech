@@ -64,6 +64,7 @@ from .const import (
     DEBUG_POLYLINES,
     CLIP_PATH,
     RECORD_FPS,
+    RECORD_SCALE,
     DATA_EXTRACTION_PROMPT,
     DEFAULT_OPENAI_MODEL,
     DEFAULT_ANTHROPIC_MODEL,
@@ -498,6 +499,7 @@ class ServiceCallData:
         self.debug_polylines: bool = data_call.data.get(DEBUG_POLYLINES, False)
         self.clip_path: str = data_call.data.get(CLIP_PATH, "")
         self.record_fps = data_call.data.get(RECORD_FPS)
+        self.record_scale = data_call.data.get(RECORD_SCALE)
         self.structure: dict | None = data_call.data.get(STRUCTURE, None)
         self.title_field: str = data_call.data.get(TITLE_FIELD, "")
         self.description_field: str = data_call.data.get(DESCRIPTION_FIELD, "")
@@ -892,6 +894,7 @@ def setup(hass, config):
             debug_polylines=call.debug_polylines,
             clip_path=call.clip_path,
             record_fps=call.record_fps,
+            record_scale=call.record_scale,
         )
 
         call.memory = Memory(hass)
