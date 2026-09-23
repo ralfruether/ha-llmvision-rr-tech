@@ -907,12 +907,16 @@ def setup(hass, config):
         # Add polyline debug information if collected
         if processor.debug_info is not None:
             response["debug"] = processor.debug_info
-        # Add recorded clip path(s) if any
-        if processor.clip_paths:
+        # Return the requested path while background recording is still running.
+        requested_clip_paths = getattr(processor, "requested_clip_paths", [])
+        clip_paths = processor.clip_paths
+        if not clip_paths and isinstance(requested_clip_paths, list):
+            clip_paths = requested_clip_paths
+        if clip_paths:
             response["clip"] = (
-                processor.clip_paths[0]
-                if len(processor.clip_paths) == 1
-                else processor.clip_paths
+                clip_paths[0]
+                if len(clip_paths) == 1
+                else clip_paths
             )
 
         await _create_event(

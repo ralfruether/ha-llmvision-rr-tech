@@ -51,6 +51,8 @@ class MediaProcessor:
         self.debug_info = None
         # Populated by stream_analyzer_pro when a clip is recorded
         self.clip_paths = []
+        self.requested_clip_paths = []
+        self.clip_task = None
 
     async def _encode_image(self, img):
         """Encode image as base64"""
@@ -540,6 +542,7 @@ class MediaProcessor:
                 stream_url, duration, record_fps, out_path, scale_width
             )
             _LOGGER.debug(f"Recording clip: {' '.join(cmd)}")
+            proc = None
             try:
                 proc = await asyncio.create_subprocess_exec(
                     *cmd,
@@ -552,6 +555,7 @@ class MediaProcessor:
                     )
                 except asyncio.TimeoutError:
                     proc.kill()
+                    await proc.wait()
                     _LOGGER.error(f"Clip recording for {camera_entity} timed out")
                     continue
                 if proc.returncode == 0 and os.path.exists(out_path):
@@ -563,6 +567,11 @@ class MediaProcessor:
                     _LOGGER.error(
                         f"Clip recording failed for {camera_entity}: {detail}"
                     )
+            except asyncio.CancelledError:
+                if proc is not None and proc.returncode is None:
+                    proc.kill()
+                    await proc.wait()
+                raise
             except Exception as err:
                 _LOGGER.error(f"Clip recording error for {camera_entity}: {err}")
 
@@ -1448,33 +1457,40 @@ class MediaProcessor:
             resolved_clip = (
                 self._resolve_output_file(clip_path) if clip_path else None
             )
-            tasks = [
-                self.record(
-                    image_entities=image_entities,
-                    duration=duration,
-                    max_frames=max_frames,
-                    target_width=target_width,
-                    include_filename=include_filename,
-                    expose_images=expose_images,
-                    fps=fps,
-                    polylines=polylines,
-                    storage_path=storage_path,
-                    debug_polylines=debug_polylines,
-                )
-            ]
             if resolved_clip is not None:
                 # Default to a 1080p cap unless the caller sets record_scale (0 = native)
                 scale_width = 1920 if record_scale is None else int(record_scale)
-                tasks.append(
+                entities = list(image_entities)
+                self.requested_clip_paths = [
+                    (
+                        resolved_clip
+                        if len(entities) == 1
+                        else self._suffix_path(resolved_clip, camera_entity)
+                    )
+                    for camera_entity in entities
+                ]
+                self.clip_task = self.hass.async_create_task(
                     self.record_clip(
                         image_entities=image_entities,
                         duration=duration,
                         resolved_path=resolved_clip,
                         record_fps=record_fps,
                         scale_width=scale_width,
-                    )
+                    ),
+                    name="llmvision_clip_recording",
                 )
-            await asyncio.gather(*tasks)
+            await self.record(
+                image_entities=image_entities,
+                duration=duration,
+                max_frames=max_frames,
+                target_width=target_width,
+                include_filename=include_filename,
+                expose_images=expose_images,
+                fps=fps,
+                polylines=polylines,
+                storage_path=storage_path,
+                debug_polylines=debug_polylines,
+            )
         return self.client
 
     async def add_visual_data(
