@@ -854,7 +854,12 @@ class AzureOpenAI(Provider):
         return {"Content-type": "application/json", "api-key": self.api_key}
 
     def _uses_completion_tokens(self) -> bool:
-        """Return True when Azure expects max_completion_tokens (gpt-5 family)."""
+        """Return True when Azure expects max_completion_tokens."""
+        model = (self.model or "").lower()
+        return any(family in model for family in ("gpt-5", "gpt-6"))
+
+    def _omits_sampling_parameters(self) -> bool:
+        """Return True when Azure rejects temperature and top_p."""
         return "gpt-5" in (self.model or "").lower()
 
     async def _make_request(self, data: dict) -> str:
@@ -890,11 +895,12 @@ class AzureOpenAI(Provider):
         }
 
         if self._uses_completion_tokens():
-            payload.pop("temperature", None)
-            payload.pop("top_p", None)
             payload["max_completion_tokens"] = call.max_tokens
         else:
             payload["max_tokens"] = call.max_tokens
+        if self._omits_sampling_parameters():
+            payload.pop("temperature", None)
+            payload.pop("top_p", None)
         for image, filename in zip(call.base64_images, call.filenames):
             tag = (
                 ("Image " + str(call.base64_images.index(image) + 1))
@@ -966,11 +972,12 @@ class AzureOpenAI(Provider):
         }
 
         if self._uses_completion_tokens():
-            payload.pop("temperature", None)
-            payload.pop("top_p", None)
             payload["max_completion_tokens"] = call.max_tokens
         else:
             payload["max_tokens"] = call.max_tokens
+        if self._omits_sampling_parameters():
+            payload.pop("temperature", None)
+            payload.pop("top_p", None)
 
         # Add structured output format if requested
         if call.response_format == "json" and call.structure:

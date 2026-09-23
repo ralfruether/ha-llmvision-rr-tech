@@ -794,13 +794,14 @@ class TestAzureOpenAI:
             assert headers["api-key"] == "test_api_key"
             assert headers["Content-type"] == "application/json"
 
-    def test_uses_completion_tokens_gpt5(self, mock_hass):
-        """Test _uses_completion_tokens for gpt-5."""
+    @pytest.mark.parametrize("model", ["gpt-5", "gpt-6", "gpt-6-luna", "GPT-6-LUNA"])
+    def test_uses_completion_tokens(self, mock_hass, model):
+        """Test completion-token detection for GPT-5 and GPT-6 families."""
         with patch("custom_components.llmvision.providers.async_get_clientsession"):
             azure = AzureOpenAI(
                 mock_hass,
                 "test_api_key",
-                "gpt-5",
+                model,
                 endpoint={
                     "base_url": "test",
                     "endpoint": "test",
@@ -810,6 +811,48 @@ class TestAzureOpenAI:
             )
 
             assert azure._uses_completion_tokens() is True
+
+    @pytest.mark.parametrize(
+        ("model", "supports_sampling"),
+        [("gpt-6-luna", True), ("gpt-5", False)],
+    )
+    def test_completion_token_payloads(self, mock_hass, model, supports_sampling):
+        """Test token and sampling fields for Azure reasoning models."""
+        with patch("custom_components.llmvision.providers.async_get_clientsession"):
+            azure = AzureOpenAI(
+                mock_hass,
+                "test_api_key",
+                model,
+                endpoint={
+                    "base_url": "test",
+                    "endpoint": "test",
+                    "deployment": "test",
+                    "api_version": "2024-02-01",
+                },
+            )
+            call = Mock()
+            call.max_tokens = 1000
+            call.base64_images = ["base64_image"]
+            call.filenames = ["test.jpg"]
+            call.message = "Analyze"
+            call.provider = "test_provider"
+            call.response_format = "text"
+            call.structure = None
+            call.use_memory = False
+            mock_hass.data = {DOMAIN: {}}
+
+            with (
+                patch.object(azure, "_get_system_prompt", return_value="System"),
+                patch.object(azure, "_get_title_prompt", return_value="Title"),
+            ):
+                vision_payload = azure._prepare_vision_data(call)
+                text_payload = azure._prepare_text_data(call)
+
+            for payload in (vision_payload, text_payload):
+                assert payload["max_completion_tokens"] == 1000
+                assert "max_tokens" not in payload
+                assert ("temperature" in payload) is supports_sampling
+                assert ("top_p" in payload) is supports_sampling
 
     def test_uses_completion_tokens_gpt4(self, mock_hass):
         """Test _uses_completion_tokens for gpt-4."""
