@@ -812,11 +812,8 @@ class TestAzureOpenAI:
 
             assert azure._uses_completion_tokens() is True
 
-    @pytest.mark.parametrize(
-        ("model", "supports_sampling"),
-        [("gpt-6-luna", True), ("gpt-5", False)],
-    )
-    def test_completion_token_payloads(self, mock_hass, model, supports_sampling):
+    @pytest.mark.parametrize("model", ["gpt-6-luna", "gpt-5"])
+    def test_completion_token_payloads(self, mock_hass, model):
         """Test token and sampling fields for Azure reasoning models."""
         with patch("custom_components.llmvision.providers.async_get_clientsession"):
             azure = AzureOpenAI(
@@ -851,8 +848,8 @@ class TestAzureOpenAI:
             for payload in (vision_payload, text_payload):
                 assert payload["max_completion_tokens"] == 1000
                 assert "max_tokens" not in payload
-                assert ("temperature" in payload) is supports_sampling
-                assert ("top_p" in payload) is supports_sampling
+                assert "temperature" not in payload
+                assert "top_p" not in payload
 
     def test_uses_completion_tokens_gpt4(self, mock_hass):
         """Test _uses_completion_tokens for gpt-4."""

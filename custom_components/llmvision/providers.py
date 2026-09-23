@@ -860,7 +860,8 @@ class AzureOpenAI(Provider):
 
     def _omits_sampling_parameters(self) -> bool:
         """Return True when Azure rejects temperature and top_p."""
-        return "gpt-5" in (self.model or "").lower()
+        model = (self.model or "").lower()
+        return any(family in model for family in ("gpt-5", "gpt-6"))
 
     async def _make_request(self, data: dict) -> str:
         headers = self._generate_headers()
