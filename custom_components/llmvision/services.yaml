@@ -711,7 +711,7 @@ stream_analyzer_pro:
     polylines:
       name: Polylines
       required: false
-      description: 'List of polylines drawn in red on every analyzed frame except the key frame. Each polyline is a list of [x, y] points with coordinates normalized to the 0-1 range. Example: [[[0.1, 0.5], [0.9, 0.5]]]'
+      description: 'List of polylines drawn in red on every frame sent to the model. The separately exposed key frame remains clean. Each polyline is a list of [x, y] points with coordinates normalized to the 0-1 range. Example: [[[0.1, 0.5], [0.9, 0.5]]]'
       example: '[[[0.1, 0.5], [0.9, 0.5]]]'
       selector:
         object:

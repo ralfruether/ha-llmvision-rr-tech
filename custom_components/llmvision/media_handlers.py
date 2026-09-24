@@ -655,7 +655,7 @@ class MediaProcessor:
             target_width (int): Target width for the images in pixels
             fps (float): Optional capture rate; overrides the duration cadence
             polylines (list): Optional normalized polylines drawn in red on every
-                analyzed frame except the key frame
+                analyzed frame; the exposed key frame remains clean
             storage_path (str): Optional directory to persist analyzed snapshots
             debug_polylines (bool): When True, collect polyline debug info and
                 persist annotated frames for inspection
@@ -850,11 +850,10 @@ class MediaProcessor:
             )
 
             debug_info = [] if debug_polylines else None
-            # Add all frames (resized). Draw polylines on every analyzed frame
-            # except the key frame, which stays clean for exposure and storage.
+            # Add annotated frames to the model and analyzed-snapshot storage.
             resized_base64 = []
             for idx, (frame_name, frame_data, _) in enumerate(selected_frames):
-                if polylines and idx != key_idx:
+                if polylines:
                     resized_image, (fw, fh), resolved = (
                         await self._draw_polylines_on_image(
                             image_data=frame_data,
@@ -891,7 +890,7 @@ class MediaProcessor:
                         )
                     # In debug mode also persist annotated frames for inspection,
                     # even when expose_images is off.
-                    if debug_polylines and polylines and idx != key_idx:
+                    if debug_polylines and polylines:
                         await self._write_snapshot(
                             directory=self.snapshots_path,
                             filename=f"debug-{filename}",
@@ -904,6 +903,11 @@ class MediaProcessor:
             if expose_images:
                 key_name = selected_frames[key_idx][0]
                 key_b64 = resized_base64[key_idx]
+                if polylines:
+                    key_b64 = await self.resize_image(
+                        target_width=target_width,
+                        image_data=selected_frames[key_idx][1],
+                    )
                 await self._expose_image(
                     frame_name=key_name.split("-")[0],
                     image_data=key_b64,

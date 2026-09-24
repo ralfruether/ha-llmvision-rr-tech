@@ -360,6 +360,98 @@ class TestMediaProcessor:
         ] == ["encoded-0", "encoded-1", "encoded-2"]
 
     @pytest.mark.asyncio
+    async def test_record_annotates_model_keyframe_but_exposes_clean_copy(
+        self, processor
+    ):
+        """The selected keyframe should be annotated for analysis but exposed clean."""
+        clock = {"now": 0.0}
+
+        async def fake_sleep(delay):
+            clock["now"] += delay
+
+        processor.hass.loop.run_in_executor.side_effect = (
+            lambda _executor, func, *args: func(*args)
+        )
+        processor.hass.states.get.return_value = SimpleNamespace(
+            attributes={"entity_picture": "/api/camera_proxy/camera.front"}
+        )
+        frame_iter = iter(
+            [_make_jpeg_bytes("black"), _make_jpeg_bytes("gray")]
+        )
+
+        async def fake_fetch(*args, **kwargs):
+            frame = next(frame_iter, None)
+            if frame is None:
+                clock["now"] = 10.0
+            return frame
+
+        processor._fetch = AsyncMock(side_effect=fake_fetch)
+        processor._similarity_score = Mock(return_value=0.5)
+        processor._select_keyframe_index = AsyncMock(return_value=1)
+        processor._draw_polylines_on_image = AsyncMock(
+            wraps=processor._draw_polylines_on_image
+        )
+        processor.resize_image = AsyncMock(wraps=processor.resize_image)
+        processor._write_snapshot = AsyncMock()
+        processor._expose_image = AsyncMock()
+
+        with patch(
+            "custom_components.llmvision.media_handlers.get_url",
+            return_value="http://ha.local",
+        ), patch(
+            "custom_components.llmvision.media_handlers.time.time",
+            side_effect=lambda: clock["now"],
+        ), patch(
+            "custom_components.llmvision.media_handlers.asyncio.sleep",
+            side_effect=fake_sleep,
+        ):
+            await processor.record(
+                image_entities=["camera.front"],
+                duration=1.5,
+                max_frames=2,
+                target_width=128,
+                include_filename=False,
+                expose_images=True,
+                fps=1,
+                polylines=[[(0.0, 0.5), (1.0, 0.5)]],
+                debug_polylines=True,
+            )
+
+        model_images = [
+            call.kwargs["base64_image"]
+            for call in processor.client.add_frame.call_args_list
+        ]
+        assert len(model_images) == 2
+        for image_data in model_images:
+            image = Image.open(io.BytesIO(base64.b64decode(image_data)))
+            red, green, blue = image.getpixel(
+                (image.width // 2, image.height // 2)
+            )[:3]
+            assert red > 150 and green < 100 and blue < 100
+
+        assert [item["frame"] for item in processor.debug_info] == [
+            "camera0-frame-0",
+            "camera0-frame-1",
+        ]
+        assert [
+            call.kwargs["image_data"]
+            for call in processor._write_snapshot.await_args_list
+        ] == model_images
+
+        selected_key_bytes = processor._select_keyframe_index.await_args.args[1][1]
+        processor.resize_image.assert_awaited_once_with(
+            target_width=128,
+            image_data=selected_key_bytes,
+        )
+        exposed_image_data = processor._expose_image.await_args.kwargs["image_data"]
+        exposed_image = Image.open(io.BytesIO(base64.b64decode(exposed_image_data)))
+        red, green, blue = exposed_image.getpixel(
+            (exposed_image.width // 2, exposed_image.height // 2)
+        )[:3]
+        assert abs(red - green) < 10
+        assert abs(green - blue) < 10
+
+    @pytest.mark.asyncio
     async def test_record_raises_when_no_cameras_available(self, processor):
         """record should fail when all cameras are unavailable."""
         clock = {"now": 0.0}
