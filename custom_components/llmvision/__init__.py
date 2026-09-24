@@ -34,6 +34,7 @@ from .const import (
     CONF_MEMORY_PATHS,
     CONF_MEMORY_IMAGES_ENCODED,
     CONF_MEMORY_STRINGS,
+    CONF_RESIZE_MEMORY_IMAGES,
     CONF_SYSTEM_PROMPT,
     CONF_TITLE_PROMPT,
     CONF_AWS_ACCESS_KEY_ID,
@@ -127,6 +128,7 @@ async def async_setup_entry(hass, entry):
         CONF_MEMORY_PATHS: entry.data.get(CONF_MEMORY_PATHS),
         CONF_MEMORY_IMAGES_ENCODED: entry.data.get(CONF_MEMORY_IMAGES_ENCODED),
         CONF_MEMORY_STRINGS: entry.data.get(CONF_MEMORY_STRINGS),
+        CONF_RESIZE_MEMORY_IMAGES: entry.data.get(CONF_RESIZE_MEMORY_IMAGES, True),
         CONF_SYSTEM_PROMPT: entry.data.get(CONF_SYSTEM_PROMPT),
         CONF_TITLE_PROMPT: entry.data.get(CONF_TITLE_PROMPT),
         # Thinking/reasoning parameters

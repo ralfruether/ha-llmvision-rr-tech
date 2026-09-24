@@ -34,8 +34,11 @@ from .const import (
     CONF_RETENTION_TIME,
     CONF_TIMELINE_LANGUAGE,
     CONF_FALLBACK_PROVIDER,
+    CONF_MEMORY_IMAGES_CACHE_KEY,
+    CONF_MEMORY_IMAGES_ENCODED,
     CONF_MEMORY_PATHS,
     CONF_MEMORY_STRINGS,
+    CONF_RESIZE_MEMORY_IMAGES,
     CONF_SYSTEM_PROMPT,
     CONF_TITLE_PROMPT,
     CONF_REQUEST_TIMEOUT,
@@ -1459,6 +1462,9 @@ class llmvisionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                             vol.Optional(CONF_MEMORY_STRINGS): selector(
                                 {"text": {"multiline": False, "multiple": True}}
                             ),
+                            vol.Optional(
+                                CONF_RESIZE_MEMORY_IMAGES, default=True
+                            ): selector({"boolean": {}}),
                         }
                     ),
                     {"collapsed": True},
@@ -1502,11 +1508,12 @@ class llmvisionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             "memory_section": {
                 CONF_MEMORY_PATHS: self.init_info.get(CONF_MEMORY_PATHS),
                 CONF_MEMORY_STRINGS: self.init_info.get(CONF_MEMORY_STRINGS),
+                CONF_RESIZE_MEMORY_IMAGES: self.init_info.get(
+                    CONF_RESIZE_MEMORY_IMAGES, True
+                ),
             },
         }
-        _LOGGER.debug(f"Suggested values: {suggested}, adding to schema...")
         data_schema = self.add_suggested_values_to_schema(data_schema, suggested)
-        _LOGGER.debug(f"Data schema after suggestions: {data_schema}")
 
         if user_input is not None:
             user_input[CONF_PROVIDER] = self.init_info[CONF_PROVIDER]
@@ -1517,6 +1524,9 @@ class llmvisionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             for _key in (CONF_MEMORY_PATHS, CONF_MEMORY_STRINGS):
                 if _key not in user_input:
                     user_input[_key] = []
+            user_input.setdefault(CONF_RESIZE_MEMORY_IMAGES, True)
+            user_input[CONF_MEMORY_IMAGES_ENCODED] = []
+            user_input[CONF_MEMORY_IMAGES_CACHE_KEY] = ""
 
             errors = {}
             if len(user_input.get(CONF_MEMORY_PATHS, [])) != len(

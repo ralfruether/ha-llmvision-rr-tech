@@ -1,8 +1,26 @@
 """Unit tests for memory.py module."""
+import base64
+import io
+import json
+import os
+
 import pytest
-from unittest.mock import Mock, patch, AsyncMock
-from custom_components.llmvision.memory import Memory
+from unittest.mock import Mock, patch, AsyncMock, MagicMock
+from PIL import Image
+from homeassistant.exceptions import ServiceValidationError
+from custom_components.llmvision.memory import (
+    MAX_MEMORY_IMAGE_BYTES,
+    MAX_MEMORY_IMAGE_PIXELS,
+    MAX_MEMORY_IMAGES_BYTES,
+    Memory,
+)
 from custom_components.llmvision.const import (
+    CONF_MEMORY_IMAGES_CACHE_KEY,
+    CONF_MEMORY_IMAGES_ENCODED,
+    CONF_MEMORY_PATHS,
+    CONF_MEMORY_STRINGS,
+    CONF_PROVIDER,
+    CONF_RESIZE_MEMORY_IMAGES,
     DOMAIN,
     DEFAULT_SYSTEM_PROMPT,
     DEFAULT_TITLE_PROMPT,
@@ -229,3 +247,204 @@ class TestMemoryAdvanced:
         assert len(memory.memory_strings) == 2
         assert len(memory.memory_paths) == 2
         assert memory._system_prompt == "Custom prompt"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("resize_memory_images", "expected_size"),
+        [(True, (512, 128)), (False, (1024, 256))],
+    )
+    async def test_encode_images_respects_resize_setting(
+        self, mock_hass, tmp_path, resize_memory_images, expected_size
+    ):
+        """Memory encoding should optionally preserve source dimensions."""
+        source = tmp_path / "reference.jpg"
+        Image.new("RGB", (1024, 256), color="navy").save(source, format="JPEG")
+        mock_hass.loop.run_in_executor.side_effect = (
+            lambda _executor, func, *args: func(*args)
+        )
+        memory = Memory(mock_hass)
+        memory.resize_memory_images = resize_memory_images
+
+        encoded = await memory._encode_images([str(source)])
+
+        with Image.open(io.BytesIO(base64.b64decode(encoded[0]))) as image:
+            assert image.size == expected_size
+
+    @pytest.mark.asyncio
+    async def test_update_memory_persists_and_reuses_encoded_cache(
+        self, mock_hass, tmp_path
+    ):
+        """Encoded images should use the canonical cache key and be reusable."""
+        first = tmp_path / "first.jpg"
+        second = tmp_path / "second.jpg"
+        first.write_bytes(b"first")
+        second.write_bytes(b"second")
+        entry = Mock(
+            data={
+                CONF_PROVIDER: "Settings",
+                CONF_MEMORY_PATHS: [str(first), str(second)],
+                CONF_MEMORY_STRINGS: ["First", "Second"],
+                CONF_RESIZE_MEMORY_IMAGES: True,
+                CONF_MEMORY_IMAGES_ENCODED: [],
+            }
+        )
+        mock_hass.config_entries.async_entries.return_value = [entry]
+        mock_hass.loop.run_in_executor.side_effect = (
+            lambda _executor, func, *args: func(*args)
+        )
+        memory = Memory(mock_hass)
+        memory._encode_images = AsyncMock(return_value=["encoded-1", "encoded-2"])
+
+        await memory._update_memory()
+
+        updated = mock_hass.config_entries.async_update_entry.call_args.kwargs["data"]
+        assert updated[CONF_MEMORY_IMAGES_ENCODED] == ["encoded-1", "encoded-2"]
+        cache_key = json.loads(updated[CONF_MEMORY_IMAGES_CACHE_KEY])
+        assert cache_key == {
+            "resize": True,
+            "sources": [
+                [os.path.realpath(first), first.stat().st_size, first.stat().st_mtime_ns],
+                [
+                    os.path.realpath(second),
+                    second.stat().st_size,
+                    second.stat().st_mtime_ns,
+                ],
+            ],
+        }
+        assert "images" not in updated
+
+        entry.data = updated
+        cached_memory = Memory(mock_hass)
+        cached_memory._encode_images = AsyncMock()
+        await cached_memory._update_memory()
+        cached_memory._encode_images.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_update_memory_invalidates_cache_when_resize_mode_changes(
+        self, mock_hass, tmp_path
+    ):
+        """Changing only resize mode should regenerate equally sized caches."""
+        source = tmp_path / "reference.jpg"
+        source.write_bytes(b"reference")
+        entry = Mock(
+            data={
+                CONF_PROVIDER: "Settings",
+                CONF_MEMORY_PATHS: [str(source)],
+                CONF_MEMORY_STRINGS: ["Reference"],
+                CONF_RESIZE_MEMORY_IMAGES: True,
+                CONF_MEMORY_IMAGES_ENCODED: [],
+            }
+        )
+        mock_hass.config_entries.async_entries.return_value = [entry]
+        mock_hass.loop.run_in_executor.side_effect = (
+            lambda _executor, func, *args: func(*args)
+        )
+        memory = Memory(mock_hass)
+        memory._encode_images = AsyncMock(return_value=["resized"])
+
+        await memory._update_memory()
+
+        updated = mock_hass.config_entries.async_update_entry.call_args.kwargs["data"]
+        updated[CONF_RESIZE_MEMORY_IMAGES] = False
+        entry.data = updated
+        original_memory = Memory(mock_hass)
+        original_memory._encode_images = AsyncMock(return_value=["original-size"])
+        await original_memory._update_memory()
+
+        original_memory._encode_images.assert_awaited_once_with(
+            [str(source)]
+        )
+        refreshed = mock_hass.config_entries.async_update_entry.call_args.kwargs["data"]
+        assert refreshed[CONF_MEMORY_IMAGES_ENCODED] == ["original-size"]
+
+    @pytest.mark.asyncio
+    async def test_update_memory_invalidates_cache_when_source_changes(
+        self, mock_hass, tmp_path
+    ):
+        """Replacing an image at the same path should regenerate its cache."""
+        source = tmp_path / "reference.jpg"
+        source.write_bytes(b"first")
+        entry = Mock(
+            data={
+                CONF_PROVIDER: "Settings",
+                CONF_MEMORY_PATHS: [str(source)],
+                CONF_MEMORY_STRINGS: ["Reference"],
+                CONF_RESIZE_MEMORY_IMAGES: True,
+                CONF_MEMORY_IMAGES_ENCODED: [],
+            }
+        )
+        mock_hass.config_entries.async_entries.return_value = [entry]
+        mock_hass.loop.run_in_executor.side_effect = (
+            lambda _executor, func, *args: func(*args)
+        )
+        memory = Memory(mock_hass)
+        memory._encode_images = AsyncMock(return_value=["first-encoded"])
+        await memory._update_memory()
+        entry.data = mock_hass.config_entries.async_update_entry.call_args.kwargs[
+            "data"
+        ]
+
+        source.write_bytes(b"second-content")
+        refreshed_memory = Memory(mock_hass)
+        refreshed_memory._encode_images = AsyncMock(return_value=["second-encoded"])
+        await refreshed_memory._update_memory()
+
+        refreshed_memory._encode_images.assert_awaited_once_with([str(source)])
+
+    @pytest.mark.asyncio
+    async def test_encode_images_rejects_excessive_pixel_count(self, mock_hass):
+        """Oversized decoded images should be rejected before loading pixels."""
+        image = MagicMock()
+        image.__enter__.return_value = image
+        image.size = (MAX_MEMORY_IMAGE_PIXELS + 1, 1)
+        mock_hass.loop.run_in_executor.side_effect = (
+            lambda _executor, func, *args: func(*args)
+        )
+        memory = Memory(mock_hass)
+
+        with patch(
+            "custom_components.llmvision.memory.Image.open", return_value=image
+        ), pytest.raises(ServiceValidationError, match="exceeds"):
+            await memory._encode_images(["/media/oversized.jpg"])
+
+        image.load.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_encode_images_rejects_excessive_jpeg_size(
+        self, mock_hass, tmp_path
+    ):
+        """Encoded memory images should respect the provider payload guard."""
+        source = tmp_path / "reference.jpg"
+        Image.new("RGB", (16, 16), color="navy").save(source, format="JPEG")
+        mock_hass.loop.run_in_executor.side_effect = (
+            lambda _executor, func, *args: func(*args)
+        )
+        memory = Memory(mock_hass)
+
+        with patch(
+            "custom_components.llmvision.memory.MAX_MEMORY_IMAGE_BYTES", 1
+        ), pytest.raises(ServiceValidationError, match="Encoded memory image exceeds"):
+            await memory._encode_images([str(source)])
+
+    @pytest.mark.asyncio
+    async def test_encode_images_rejects_excessive_aggregate_size(
+        self, mock_hass, tmp_path
+    ):
+        """The combined JPEG payload should remain within its configured limit."""
+        source = tmp_path / "reference.jpg"
+        Image.new("RGB", (16, 16), color="navy").save(source, format="JPEG")
+        mock_hass.loop.run_in_executor.side_effect = (
+            lambda _executor, func, *args: func(*args)
+        )
+        memory = Memory(mock_hass)
+
+        with patch(
+            "custom_components.llmvision.memory.MAX_MEMORY_IMAGES_BYTES", 1
+        ), pytest.raises(ServiceValidationError, match="combined size limit"):
+            await memory._encode_images([str(source)])
+
+    def test_memory_image_limits_are_conservative(self):
+        """Deployed memory limits should remain explicit and reviewable."""
+        assert MAX_MEMORY_IMAGE_PIXELS == 40_000_000
+        assert MAX_MEMORY_IMAGE_BYTES == 15 * 1024 * 1024
+        assert MAX_MEMORY_IMAGES_BYTES == 20 * 1024 * 1024

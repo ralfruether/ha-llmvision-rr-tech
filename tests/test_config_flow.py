@@ -22,6 +22,7 @@ from custom_components.llmvision.const import (
     CONF_HTTPS,
     CONF_IP_ADDRESS,
     CONF_KEEP_ALIVE,
+    CONF_MEMORY_IMAGES_ENCODED,
     CONF_MEMORY_PATHS,
     CONF_MEMORY_STRINGS,
     CONF_PORT,
@@ -29,6 +30,7 @@ from custom_components.llmvision.const import (
     CONF_REASONING_EFFORT,
     CONF_REQUEST_TIMEOUT,
     CONF_RETENTION_TIME,
+    CONF_RESIZE_MEMORY_IMAGES,
     CONF_SYSTEM_PROMPT,
     CONF_TEMPERATURE,
     CONF_THINK,
@@ -207,6 +209,8 @@ class TestSettingsStep:
         assert result["data"][CONF_PROVIDER] == "Settings"
         assert result["data"][CONF_MEMORY_PATHS] == []
         assert result["data"][CONF_MEMORY_STRINGS] == []
+        assert result["data"][CONF_RESIZE_MEMORY_IMAGES] is True
+        assert result["data"][CONF_MEMORY_IMAGES_ENCODED] == []
 
     @pytest.mark.asyncio
     async def test_settings_rejects_mismatched_memory_lengths(self, build_flow):
@@ -300,6 +304,7 @@ class TestSettingsStep:
             "memory_section": {
                 CONF_MEMORY_PATHS: [],
                 CONF_MEMORY_STRINGS: [],
+                CONF_RESIZE_MEMORY_IMAGES: False,
             },
         }
 
@@ -310,6 +315,8 @@ class TestSettingsStep:
         assert result["data_updates"][CONF_PROVIDER] == "Settings"
         assert result["data_updates"][CONF_FALLBACK_PROVIDER] == "provider-entry-id"
         assert result["data_updates"][CONF_REQUEST_TIMEOUT] == 120
+        assert result["data_updates"][CONF_RESIZE_MEMORY_IMAGES] is False
+        assert result["data_updates"][CONF_MEMORY_IMAGES_ENCODED] == []
 
     @pytest.mark.asyncio
     async def test_settings_shows_form_without_input(self, build_flow, mock_hass):

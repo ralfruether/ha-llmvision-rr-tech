@@ -438,11 +438,13 @@
                         "description": "Content in memory syncs across providers and is used to provide additional context to the model.",
                         "data": {
                             "memory_paths": "Image file path",
-                            "memory_strings": "Image description"
+                            "memory_strings": "Image description",
+                            "resize_memory_images": "Resize memory images"
                         },
                         "data_description": {
                             "memory_paths": "Provide the path to the image file.",
-                            "memory_strings": "Provide a description of the image (e.g.: 'This is Cookie, my dog'). Images and descriptions must be in the same order, and there must be as many descriptions as images."
+                            "memory_strings": "Provide a description of the image (e.g.: 'This is Cookie, my dog'). Images and descriptions must be in the same order, and there must be as many descriptions as images.",
+                            "resize_memory_images": "Recommended. Resize each image so its longest side is 512 pixels before JPEG encoding. Disable to preserve source width and height in the JPEG copy. Providers may still resize images, and original dimensions increase upload size, cost, and latency."
                         }
                     }
                 }

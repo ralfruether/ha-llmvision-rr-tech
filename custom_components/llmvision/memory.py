@@ -1,8 +1,10 @@
 from .const import (
     DOMAIN,
     CONF_MEMORY_PATHS,
+    CONF_MEMORY_IMAGES_CACHE_KEY,
     CONF_MEMORY_IMAGES_ENCODED,
     CONF_MEMORY_STRINGS,
+    CONF_RESIZE_MEMORY_IMAGES,
     CONF_SYSTEM_PROMPT,
     CONF_TITLE_PROMPT,
     DEFAULT_SYSTEM_PROMPT,
@@ -10,10 +12,17 @@ from .const import (
 )
 import base64
 import io
+import json
+import os
 from PIL import Image
 import logging
+from homeassistant.exceptions import ServiceValidationError
 
 _LOGGER = logging.getLogger(__name__)
+
+MAX_MEMORY_IMAGE_PIXELS = 40_000_000
+MAX_MEMORY_IMAGE_BYTES = 15 * 1024 * 1024
+MAX_MEMORY_IMAGES_BYTES = 20 * 1024 * 1024
 
 
 class Memory:
@@ -29,6 +38,8 @@ class Memory:
             self.memory_strings = strings
             self.memory_paths = paths
             self.memory_images = []
+            self.memory_images_cache_key = ""
+            self.resize_memory_images = True
 
         else:
             self._system_prompt = (
@@ -42,6 +53,12 @@ class Memory:
             self.memory_strings = self.entry.data.get(CONF_MEMORY_STRINGS, strings)
             self.memory_paths = self.entry.data.get(CONF_MEMORY_PATHS, paths)
             self.memory_images = self.entry.data.get(CONF_MEMORY_IMAGES_ENCODED, [])
+            self.memory_images_cache_key = self.entry.data.get(
+                CONF_MEMORY_IMAGES_CACHE_KEY, ""
+            )
+            self.resize_memory_images = self.entry.data.get(
+                CONF_RESIZE_MEMORY_IMAGES, True
+            )
 
         _LOGGER.debug(self)
 
@@ -155,31 +172,55 @@ class Memory:
     async def _encode_images(self, image_paths):
         """Encode images as base64"""
         encoded_images = []
+        encoded_bytes = 0
 
-        for image_path in image_paths:
-            img = await self.hass.loop.run_in_executor(None, Image.open, image_path)
-            with img:
-                await self.hass.loop.run_in_executor(None, img.load)
-                # calculate new height and width based on aspect ratio
+        def _encode_image(image_path):
+            with Image.open(image_path) as img:
                 width, height = img.size
-                aspect_ratio = width / height
-                if aspect_ratio > 1:
-                    new_width = 512
-                    new_height = int(512 / aspect_ratio)
-                else:
-                    new_height = 512
-                    new_width = int(512 * aspect_ratio)
-                img = img.resize((new_width, new_height))
+                if width * height > MAX_MEMORY_IMAGE_PIXELS:
+                    raise ServiceValidationError(
+                        f"Memory image exceeds {MAX_MEMORY_IMAGE_PIXELS:,} pixels: "
+                        f"{image_path}"
+                    )
+                img.load()
+                if self.resize_memory_images:
+                    aspect_ratio = width / height
+                    if aspect_ratio > 1:
+                        new_width = 512
+                        new_height = int(512 / aspect_ratio)
+                    else:
+                        new_height = 512
+                        new_width = int(512 * aspect_ratio)
+                    img = img.resize((new_width, new_height))
 
                 # Convert Memory Images to RGB mode if needed
                 if img.mode == "RGBA":
                     img = img.convert("RGB")
 
-                # Encode the image to base64
                 img_byte_arr = io.BytesIO()
                 img.save(img_byte_arr, format="JPEG")
-                base64_image = base64.b64encode(img_byte_arr.getvalue()).decode("utf-8")
-                encoded_images.append(base64_image)
+                image_bytes = img_byte_arr.getvalue()
+                if len(image_bytes) > MAX_MEMORY_IMAGE_BYTES:
+                    raise ServiceValidationError(
+                        f"Encoded memory image exceeds {MAX_MEMORY_IMAGE_BYTES:,} "
+                        f"bytes: {image_path}"
+                    )
+                return (
+                    base64.b64encode(image_bytes).decode("utf-8"),
+                    len(image_bytes),
+                )
+
+        for image_path in image_paths:
+            base64_image, image_size = await self.hass.loop.run_in_executor(
+                None, _encode_image, image_path
+            )
+            encoded_bytes += image_size
+            if encoded_bytes > MAX_MEMORY_IMAGES_BYTES:
+                raise ServiceValidationError(
+                    "Encoded memory images exceed the combined size limit of "
+                    f"{MAX_MEMORY_IMAGES_BYTES:,} bytes"
+                )
+            encoded_images.append(base64_image)
 
         return encoded_images
 
@@ -190,12 +231,38 @@ class Memory:
             _LOGGER.debug("Memory entry not found; skipping memory update.")
             return
 
-        if len(self.memory_paths) != len(self.memory_images):
-            self.memory_images = await self._encode_images(self.memory_paths)
+        def _source_metadata():
+            metadata = []
+            for path in self.memory_paths:
+                try:
+                    stat = os.stat(path)
+                    metadata.append(
+                        [os.path.realpath(path), stat.st_size, stat.st_mtime_ns]
+                    )
+                except OSError:
+                    metadata.append([path, None, None])
+            return metadata
 
-            # update memory with new images
+        source_metadata = await self.hass.loop.run_in_executor(None, _source_metadata)
+        cache_key = json.dumps(
+            {
+                "sources": source_metadata,
+                "resize": self.resize_memory_images,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        if (
+            len(self.memory_paths) != len(self.memory_images)
+            or self.memory_images_cache_key != cache_key
+        ):
+            self.memory_images = await self._encode_images(self.memory_paths)
+            self.memory_images_cache_key = cache_key
+
             memory = self.entry.data.copy()
-            memory["images"] = self.memory_images
+            memory[CONF_MEMORY_IMAGES_ENCODED] = self.memory_images
+            memory[CONF_MEMORY_IMAGES_CACHE_KEY] = self.memory_images_cache_key
+            memory.pop("images", None)
             self.hass.config_entries.async_update_entry(self.entry, data=memory)
 
     def __str__(self):
