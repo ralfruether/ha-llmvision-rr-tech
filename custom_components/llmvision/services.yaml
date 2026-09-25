@@ -409,13 +409,13 @@ video_analyzer_pro:
     target_width:
       name: Target Width
       required: false
-      description: 'Width in pixels to downscale'
+      description: 'Width in pixels to downscale (never upscales). Match the provider''s image limit, e.g. 2048 for Azure OpenAI GPT-6 models.'
       example: 1280
       default: 1280
       selector:
         number:
           min: 512
-          max: 1920
+          max: 3840
     max_tokens:
       name: Maximum Tokens
       description: 'Maximum number of tokens to generate'
@@ -747,10 +747,21 @@ stream_analyzer_pro:
     clip_path:
       name: Clip Path
       required: false
-      description: 'Full path (including filename) for a recorded video clip of the live stream, captured independently of the analyzed snapshots and transcoded to a fluent H.264 mp4. Relative paths are stored under /media/llmvision/. Absolute paths must resolve inside the Home Assistant media or config directory. With multiple cameras, the camera name is inserted before the extension.'
+      description: 'Full path (including filename) for a recorded video clip of the live stream, transcoded to a fluent H.264 mp4 (.mp4, .m4v or .mov). With frame_source snapshot the clip is recorded independently of the analyzed snapshots; with frame_source stream it is written by the same ffmpeg session that decodes the frames. Relative paths are stored under /media/llmvision/. Absolute paths must resolve inside the Home Assistant media or config directory. With multiple cameras, the camera name is inserted before the extension.'
       example: '/media/llmvision/clips/front_door.mp4'
       selector:
         text:
+    frame_source:
+      name: Frame Source
+      required: false
+      description: 'Where analyzed frames come from. snapshot (default) uses the camera entity picture. stream decodes frames from the camera video stream (full stream resolution, same ffmpeg session as clip_path) and falls back to snapshots per camera when the stream is unavailable. Stream frames can show more detail (faces, plates) to the AI provider; the first frame may arrive a few seconds after the call starts.'
+      example: 'stream'
+      default: 'snapshot'
+      selector:
+        select:
+          options:
+            - "snapshot"
+            - "stream"
     record_fps:
       name: Recording FPS
       required: false
@@ -785,13 +796,13 @@ stream_analyzer_pro:
     target_width:
       name: Target Width
       required: false
-      description: 'Width in pixels to downscale'
+      description: 'Width in pixels to downscale (never upscales). Match the provider''s image limit, e.g. 2048 for Azure OpenAI GPT-6 models.'
       example: 1280
       default: 1280
       selector:
         number:
           min: 512
-          max: 1920
+          max: 3840
     max_tokens:
       name: Maximum Tokens
       description: 'Maximum number of tokens to generate'

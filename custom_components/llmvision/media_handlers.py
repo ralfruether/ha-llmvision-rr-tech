@@ -23,6 +23,30 @@ from homeassistant.helpers.network import get_url
 from homeassistant.exceptions import ServiceValidationError
 
 from .const import DOMAIN
+from .stream_capture import (
+    ALLOWED_CLIP_EXTENSIONS,
+    ALLOWED_STREAM_SCHEMES,
+    FRAME_SOURCE_STREAM,
+    MAX_FRAME_PIXELS,
+    MAX_MALFORMED_FRAMES,
+    MAX_STREAM_FRAMES,
+    PROCESS_STOP_TIMEOUT,
+    STDERR_TAIL_BYTES,
+    STREAM_GRACE,
+    STREAM_READ_CHUNK,
+    STREAM_STALL_TIMEOUT,
+    STREAM_STARTUP_TIMEOUT,
+    JpegStreamSplitter,
+    build_stream_capture_cmd,
+    coerce_number,
+    normalize_frame_source,
+    redact,
+    redacted_command,
+    stream_frame_cap,
+    stream_frame_rate,
+    stream_input_args,
+    stream_scheme,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -53,11 +77,14 @@ class MediaProcessor:
         self.clip_paths = []
         self.requested_clip_paths = []
         self.clip_task = None
+        # JPEG encoder options; the pro services opt into higher quality
+        self.jpeg_options = {}
+        self.ffmpeg_jpeg_q = 5
 
     async def _encode_image(self, img):
         """Encode image as base64"""
         img_byte_arr = io.BytesIO()
-        img.save(img_byte_arr, format="JPEG")
+        img.save(img_byte_arr, format="JPEG", **self.jpeg_options)
         base64_image = base64.b64encode(img_byte_arr.getvalue()).decode("utf-8")
         return base64_image
 
@@ -438,6 +465,11 @@ class MediaProcessor:
             raise ServiceValidationError(
                 "clip_path resolves outside the allowed media/config directory"
             )
+        # ffmpeg overwrites (-y); only video container files may be written
+        if os.path.splitext(candidate)[1].lower() not in ALLOWED_CLIP_EXTENSIONS:
+            raise ServiceValidationError(
+                "clip_path must end with " + ", ".join(ALLOWED_CLIP_EXTENSIONS)
+            )
         return candidate
 
     @staticmethod
@@ -448,34 +480,28 @@ class MediaProcessor:
         return f"{stem}-{safe}{ext}"
 
     @staticmethod
-    def _build_clip_ffmpeg_cmd(
-        stream_url, duration, record_fps, out_path, scale_width=1920
-    ):
-        """Build the ffmpeg command to transcode a stream to a phone-friendly mp4.
+    def _clip_output_args(duration, record_fps, out_path, scale_width=1920):
+        """ffmpeg output options that transcode a stream to a phone-friendly mp4.
 
         Downscales oversized streams (never upscales), lets libx264 pick the
         correct H.264 level for the resolution, and uses a short keyframe
         interval so playback decodes smoothly. Frame timing is preserved
         (native) unless a record_fps is given to force a constant rate.
         """
+        # Values end up in an ffmpeg filter graph: accept plain numbers only
+        record_fps = coerce_number(record_fps, "record_fps", 1, 60)
+        scale_width = coerce_number(
+            scale_width, "record_scale", 0, 7680, integer=True
+        )
         filters = []
-        if scale_width and int(scale_width) > 0:
+        if scale_width and scale_width > 0:
             # Cap width, keep aspect (even height); min() avoids upscaling
-            filters.append(f"scale='min({int(scale_width)},iw)':-2")
+            filters.append(f"scale='min({scale_width},iw)':-2")
         if record_fps:
-            filters.append(f"fps={record_fps}")
+            filters.append(f"fps={record_fps:g}")
         gop = int((record_fps or 15) * 2)
 
-        cmd = [
-            "ffmpeg",
-            "-nostdin",
-            "-hide_banner",
-            "-loglevel",
-            "warning",
-            "-rtsp_transport",
-            "tcp",
-            "-i",
-            stream_url,
+        args = [
             "-t",
             str(duration),
             "-an",
@@ -483,8 +509,8 @@ class MediaProcessor:
             "-dn",
         ]
         if filters:
-            cmd += ["-vf", ",".join(filters)]
-        cmd += [
+            args += ["-vf", ",".join(filters)]
+        args += [
             "-c:v",
             "libx264",
             "-preset",
@@ -502,7 +528,24 @@ class MediaProcessor:
             "-y",
             out_path,
         ]
-        return cmd
+        return args
+
+    @classmethod
+    def _build_clip_ffmpeg_cmd(
+        cls, stream_url, duration, record_fps, out_path, scale_width=1920
+    ):
+        """Build the ffmpeg command to transcode a stream to a phone-friendly mp4."""
+        return [
+            "ffmpeg",
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            *stream_input_args(stream_url),
+            "-i",
+            stream_url,
+            *cls._clip_output_args(duration, record_fps, out_path, scale_width),
+        ]
 
     async def record_clip(
         self, image_entities, duration, resolved_path, record_fps=None, scale_width=1920
@@ -525,7 +568,7 @@ class MediaProcessor:
                 stream_url = await _async_get_stream_source(self.hass, camera_entity)
             except Exception as err:
                 _LOGGER.warning(
-                    f"Could not get stream source for {camera_entity}: {err}"
+                    f"Could not get stream source for {camera_entity}: {redact(err)}"
                 )
                 continue
             if not stream_url:
@@ -541,7 +584,7 @@ class MediaProcessor:
             cmd = self._build_clip_ffmpeg_cmd(
                 stream_url, duration, record_fps, out_path, scale_width
             )
-            _LOGGER.debug(f"Recording clip: {' '.join(cmd)}")
+            _LOGGER.debug(f"Recording clip: {redacted_command(cmd, stream_url)}")
             proc = None
             try:
                 proc = await asyncio.create_subprocess_exec(
@@ -562,10 +605,13 @@ class MediaProcessor:
                     written.append(out_path)
                 else:
                     detail = (
-                        stderr.decode(errors="ignore") if stderr else "unknown error"
+                        stderr[-STDERR_TAIL_BYTES:].decode(errors="ignore")
+                        if stderr
+                        else "unknown error"
                     )
                     _LOGGER.error(
-                        f"Clip recording failed for {camera_entity}: {detail}"
+                        f"Clip recording failed for {camera_entity}: "
+                        f"{redact(detail, stream_url)}"
                     )
             except asyncio.CancelledError:
                 if proc is not None and proc.returncode is None:
@@ -573,10 +619,310 @@ class MediaProcessor:
                     await proc.wait()
                 raise
             except Exception as err:
-                _LOGGER.error(f"Clip recording error for {camera_entity}: {err}")
+                _LOGGER.error(
+                    f"Clip recording error for {camera_entity}: "
+                    f"{redact(err, stream_url)}"
+                )
 
         self.clip_paths = written
         return written
+
+    @staticmethod
+    def _frame_label(image_entity, camera_number, frame_index, include_filename):
+        """Frame label matching the snapshot capture naming."""
+        prefix = (
+            image_entity.replace("camera.", "")
+            if include_filename
+            else f"camera{camera_number}"
+        )
+        return f"{prefix}-frame-{frame_index}"
+
+    def _analyze_stream_frame(self, jpeg_data, previous_gray):
+        """Decode one piped frame; return (gray, score) or None to skip it.
+
+        Runs in the executor. The pixel count is checked from the header before the
+        image is decoded.
+        """
+        try:
+            with Image.open(io.BytesIO(jpeg_data)) as img:
+                width, height = img.size
+                if width * height > MAX_FRAME_PIXELS:
+                    _LOGGER.warning(
+                        f"Skipping oversized stream frame ({width}x{height})"
+                    )
+                    return None
+                img.load()
+                gray = np.array(img.convert("L"))
+        except (
+            UnidentifiedImageError,
+            Image.DecompressionBombError,
+            OSError,
+            ValueError,
+        ) as err:
+            _LOGGER.warning(f"Skipping undecodable stream frame: {type(err).__name__}")
+            return None
+        if previous_gray is None:
+            return gray, None
+        if previous_gray.shape != gray.shape:
+            # Resolution changed mid-stream: treat as maximal change
+            return gray, 0.0
+        return gray, self._similarity_score(previous_gray, gray)
+
+    @staticmethod
+    async def _drain_stderr(stream, tail):
+        """Consume stderr so ffmpeg never blocks on it, keeping only the tail."""
+        if stream is None:
+            return
+        while True:
+            chunk = await stream.read(4096)
+            if not chunk:
+                return
+            tail += chunk
+            if len(tail) > STDERR_TAIL_BYTES:
+                del tail[:-STDERR_TAIL_BYTES]
+
+    @staticmethod
+    async def _discard_stream(stream):
+        """Read and drop a pipe until EOF."""
+        if stream is None:
+            return
+        while await stream.read(STREAM_READ_CHUNK):
+            pass
+
+    async def _stop_process(self, proc):
+        """Stop ffmpeg: terminate so outputs are finalized, then kill.
+
+        stdout keeps being drained meanwhile so ffmpeg cannot block on a full pipe.
+        Returns True when the process had to be killed.
+        """
+        if proc.returncode is not None:
+            return False
+        drain = asyncio.ensure_future(self._discard_stream(proc.stdout))
+        killed = False
+        try:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                return False
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=PROCESS_STOP_TIMEOUT)
+            except asyncio.TimeoutError:
+                killed = True
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                await proc.wait()
+        finally:
+            drain.cancel()
+            try:
+                await drain
+            except (asyncio.CancelledError, Exception):
+                pass
+        return killed
+
+    async def _capture_stream_camera(
+        self,
+        image_entity,
+        camera_number,
+        duration,
+        frame_rate,
+        frame_cap,
+        target_width,
+        include_filename,
+        clip_plan=None,
+    ):
+        """Decode analysis frames from a camera's video stream with one ffmpeg process.
+
+        When clip_plan (path, record_fps, scale_width) is given, the same process also
+        writes the clip, so the stream is opened only once. Returns (first_frame,
+        frames) in the snapshot capture format, or None when the stream is unusable so
+        the caller can fall back to snapshots.
+        """
+        try:
+            stream_url = await _async_get_stream_source(self.hass, image_entity)
+        except Exception as err:
+            _LOGGER.warning(
+                f"Could not get stream source for {image_entity}: {redact(err)}"
+            )
+            return None
+        if not stream_url:
+            _LOGGER.warning(f"Camera {image_entity} has no stream source")
+            return None
+        scheme = stream_scheme(stream_url)
+        if scheme not in ALLOWED_STREAM_SCHEMES:
+            _LOGGER.warning(
+                f"Camera {image_entity} uses unsupported stream scheme '{scheme}'"
+            )
+            return None
+
+        clip_path = None
+        clip_args = None
+        if clip_plan:
+            clip_path, record_fps, scale_width = clip_plan
+            await self.hass.loop.run_in_executor(
+                None,
+                partial(os.makedirs, os.path.dirname(clip_path), exist_ok=True),
+            )
+            clip_args = self._clip_output_args(
+                duration, record_fps, clip_path, scale_width
+            )
+
+        cmd = build_stream_capture_cmd(
+            stream_url,
+            duration,
+            frame_rate,
+            target_width,
+            frame_cap,
+            jpeg_q=self.ffmpeg_jpeg_q,
+            clip_output_args=clip_args,
+        )
+        _LOGGER.debug(
+            f"Capturing stream frames for {image_entity}: "
+            f"{redacted_command(cmd, stream_url)}"
+        )
+
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        deadline = started + float(duration) + STREAM_GRACE
+        startup_deadline = started + STREAM_STARTUP_TIMEOUT
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except Exception as err:
+            _LOGGER.error(
+                f"Could not start ffmpeg for {image_entity}: {redact(err, stream_url)}"
+            )
+            return None
+
+        stderr_tail = bytearray()
+        stderr_task = asyncio.ensure_future(
+            self._drain_stderr(proc.stderr, stderr_tail)
+        )
+        splitter = JpegStreamSplitter()
+        first_frame = None
+        frames = {}
+        previous_gray = None
+        frame_index = 0
+        timed_out = False
+        stop_now = False
+        killed = False
+        try:
+            while True:
+                limit = (
+                    startup_deadline if first_frame is None else deadline
+                ) - loop.time()
+                if limit <= 0:
+                    timed_out = True
+                    break
+                try:
+                    # Once the frame cap is reached ffmpeg's frame output is done while
+                    # the clip may still be recording: only the wall deadline applies.
+                    timeout = (
+                        min(limit, STREAM_STALL_TIMEOUT)
+                        if frame_index < frame_cap
+                        else limit
+                    )
+                    chunk = await asyncio.wait_for(
+                        proc.stdout.read(STREAM_READ_CHUNK), timeout=timeout
+                    )
+                except asyncio.TimeoutError:
+                    timed_out = True
+                    break
+                if not chunk:
+                    break
+                for jpeg_data in splitter.feed(chunk):
+                    # Keep draining past the cap; ffmpeg's -frames:v bounds output too
+                    if frame_index >= frame_cap:
+                        continue
+                    analyzed = await self.hass.loop.run_in_executor(
+                        None, self._analyze_stream_frame, jpeg_data, previous_gray
+                    )
+                    if analyzed is None:
+                        continue
+                    gray, score = analyzed
+                    label = self._frame_label(
+                        image_entity, camera_number, frame_index, include_filename
+                    )
+                    if first_frame is None:
+                        first_frame = (label, jpeg_data)
+                    else:
+                        frames[label] = {
+                            "frame_data": jpeg_data,
+                            "ssim_score": score,
+                            "camera_number": camera_number,
+                            "frame_index": frame_index,
+                        }
+                    previous_gray = gray
+                    frame_index += 1
+                if splitter.malformed >= MAX_MALFORMED_FRAMES:
+                    _LOGGER.warning(
+                        f"Stream for {image_entity} produced malformed frames; stopping"
+                    )
+                    stop_now = True
+                    break
+            if not timed_out and not stop_now:
+                # stdout closed: give the clip output time to finalize
+                try:
+                    await asyncio.wait_for(
+                        proc.wait(), timeout=max(1.0, deadline - loop.time())
+                    )
+                except asyncio.TimeoutError:
+                    timed_out = True
+            killed = await self._stop_process(proc)
+        except asyncio.CancelledError:
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                await proc.wait()
+            killed = True
+            raise
+        finally:
+            if proc.returncode is None:
+                # Unexpected error: never leave ffmpeg running unattended
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                await proc.wait()
+                killed = True
+            stderr_task.cancel()
+            try:
+                await stderr_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            if clip_path and killed:
+                # A killed ffmpeg leaves an unplayable mp4 without its index
+                try:
+                    await self.hass.loop.run_in_executor(None, os.remove, clip_path)
+                except OSError:
+                    pass
+
+        returncode = proc.returncode
+        if timed_out or returncode not in (0, None):
+            detail = redact(stderr_tail.decode(errors="ignore"), stream_url)
+            _LOGGER.warning(
+                f"Stream capture for {image_entity} ended early "
+                f"(returncode={returncode}, timed_out={timed_out}): {detail[-1000:]}"
+            )
+        if clip_path and not killed:
+            try:
+                size = await self.hass.loop.run_in_executor(
+                    None, os.path.getsize, clip_path
+                )
+            except OSError:
+                size = 0
+            if size > 0:
+                self.clip_paths.append(clip_path)
+
+        if first_frame is None:
+            return None
+        return first_frame, frames
 
     async def _draw_polylines_on_image(self, image_data, target_width, polylines):
         """Resize an image to target_width and draw red polylines on it.
@@ -592,7 +938,9 @@ class MediaProcessor:
             width, height = img.size
             aspect_ratio = width / height
             target_height = int(target_width / aspect_ratio)
-            if width > target_width or height > target_height:
+            # Width alone decides: a float-rounded target_height must not trigger a
+            # 1 px resample of frames ffmpeg already scaled to target_width.
+            if width > target_width:
                 img = img.resize((target_width, target_height))
             w, h = img.size
             resolved = []
@@ -606,7 +954,7 @@ class MediaProcessor:
                     resolved.append(px_points)
                     draw.line(px_points, fill=(255, 0, 0), width=line_width)
             buffer = io.BytesIO()
-            img.save(buffer, format="JPEG")
+            img.save(buffer, format="JPEG", **self.jpeg_options)
             base64_image = base64.b64encode(buffer.getvalue()).decode("utf-8")
             return base64_image, (w, h), resolved
 
@@ -646,6 +994,8 @@ class MediaProcessor:
         polylines=None,
         storage_path=None,
         debug_polylines=False,
+        frame_source=None,
+        clip_plans=None,
     ):
         """Wrapper for client.add_frame with integrated recorder
 
@@ -659,6 +1009,10 @@ class MediaProcessor:
             storage_path (str): Optional directory to persist analyzed snapshots
             debug_polylines (bool): When True, collect polyline debug info and
                 persist annotated frames for inspection
+            frame_source (str): "stream" decodes frames from the camera stream
+                (falling back to snapshots per camera); default uses snapshots
+            clip_plans (dict): Stream mode only; camera entity to
+                (clip_path, record_fps, scale_width) written by the same ffmpeg
         """
 
         polylines = self._validate_polylines(polylines)
@@ -725,7 +1079,7 @@ class MediaProcessor:
                         )
                         # Encode the image back to bytes
                         buffer = io.BytesIO()
-                        img.save(buffer, format="JPEG")
+                        img.save(buffer, format="JPEG", **self.jpeg_options)
                         frame_data = buffer.getvalue()
 
                         # Use either entity name or assign number to each camera
@@ -760,7 +1114,7 @@ class MediaProcessor:
                         previous_frame = current_frame_gray
                         # Normalize to JPEG
                         buffer = io.BytesIO()
-                        img.save(buffer, format="JPEG")
+                        img.save(buffer, format="JPEG", **self.jpeg_options)
                         first_bytes = buffer.getvalue()
                         if include_filename:
                             parts = [
@@ -804,10 +1158,36 @@ class MediaProcessor:
         )
         _LOGGER.info(f"Recording {camera_names} for {duration} seconds")
 
+        frame_rate = frame_cap = None
+        if frame_source == FRAME_SOURCE_STREAM:
+            frame_rate, rate = stream_frame_rate(fps, interval)
+            frame_cap = stream_frame_cap(duration, rate)
+
+        async def capture_camera(image_entity, camera_number):
+            if frame_source == FRAME_SOURCE_STREAM:
+                captured = await self._capture_stream_camera(
+                    image_entity=image_entity,
+                    camera_number=camera_number,
+                    duration=duration,
+                    frame_rate=frame_rate,
+                    frame_cap=frame_cap,
+                    target_width=target_width,
+                    include_filename=include_filename,
+                    clip_plan=(clip_plans or {}).get(image_entity),
+                )
+                if captured is not None:
+                    first_frames[image_entity], camera_frames[image_entity] = captured
+                    successful_image_entities.add(image_entity)
+                    return
+                _LOGGER.warning(
+                    f"Falling back to snapshot capture for {image_entity}"
+                )
+            await record_camera(image_entity, camera_number)
+
         # start threads for each camera
         await asyncio.gather(
             *(
-                record_camera(image_entity, image_entities.index(image_entity))
+                capture_camera(image_entity, image_entities.index(image_entity))
                 for image_entity in image_entities
             )
         )
@@ -1068,7 +1448,7 @@ class MediaProcessor:
                 "-vsync",
                 "0",  # disable v-sync to avoid frame duplication
                 "-q:v",  # quality level for JPEG (lower is better)
-                "5",  # 5 medium quality
+                str(self.ffmpeg_jpeg_q),  # 5 medium quality; pro services use 2
                 "-f",
                 "image2pipe",  # output to pipe
                 "-vcodec",
@@ -1454,13 +1834,37 @@ class MediaProcessor:
         clip_path=None,
         record_fps=None,
         record_scale=None,
+        frame_source=None,
     ):
+        frame_source = normalize_frame_source(frame_source)
         if image_entities:
             # Resolve/confine the clip path before recording so a bad path fails
             # fast without cancelling the snapshot capture.
             resolved_clip = (
                 self._resolve_output_file(clip_path) if clip_path else None
             )
+            # Values below reach ffmpeg arguments and filters: plain numbers only
+            if resolved_clip is not None:
+                record_fps = coerce_number(record_fps, "record_fps", 1, 60)
+                record_scale = coerce_number(
+                    record_scale, "record_scale", 0, 7680, integer=True
+                )
+            if frame_source == FRAME_SOURCE_STREAM:
+                duration = coerce_number(
+                    duration, "duration", 1, 600, allow_none=False
+                )
+                fps = coerce_number(fps, "fps", 0.1, 30)
+                target_width = coerce_number(
+                    target_width, "target_width", 64, 7680, integer=True,
+                    allow_none=False,
+                )
+                _, rate = stream_frame_rate(fps, self._compute_interval(duration, fps))
+                if duration * rate > MAX_STREAM_FRAMES:
+                    raise ServiceValidationError(
+                        f"frame_source stream decodes at most {MAX_STREAM_FRAMES} "
+                        "frames per camera; reduce duration or fps"
+                    )
+            clip_plans = None
             if resolved_clip is not None:
                 # Default to a 1080p cap unless the caller sets record_scale (0 = native)
                 scale_width = 1920 if record_scale is None else int(record_scale)
@@ -1473,16 +1877,25 @@ class MediaProcessor:
                     )
                     for camera_entity in entities
                 ]
-                self.clip_task = self.hass.async_create_task(
-                    self.record_clip(
-                        image_entities=image_entities,
-                        duration=duration,
-                        resolved_path=resolved_clip,
-                        record_fps=record_fps,
-                        scale_width=scale_width,
-                    ),
-                    name="llmvision_clip_recording",
-                )
+                if frame_source == FRAME_SOURCE_STREAM:
+                    # The frame-capturing ffmpeg process also writes the clip
+                    clip_plans = {
+                        camera_entity: (path, record_fps, scale_width)
+                        for camera_entity, path in zip(
+                            entities, self.requested_clip_paths
+                        )
+                    }
+                else:
+                    self.clip_task = self.hass.async_create_task(
+                        self.record_clip(
+                            image_entities=image_entities,
+                            duration=duration,
+                            resolved_path=resolved_clip,
+                            record_fps=record_fps,
+                            scale_width=scale_width,
+                        ),
+                        name="llmvision_clip_recording",
+                    )
             await self.record(
                 image_entities=image_entities,
                 duration=duration,
@@ -1494,7 +1907,15 @@ class MediaProcessor:
                 polylines=polylines,
                 storage_path=storage_path,
                 debug_polylines=debug_polylines,
+                frame_source=frame_source,
+                clip_plans=clip_plans,
             )
+            if clip_plans:
+                # Report clips in camera order, not in ffmpeg completion order
+                written = set(self.clip_paths)
+                self.clip_paths = [
+                    path for path in self.requested_clip_paths if path in written
+                ]
         return self.client
 
     async def add_visual_data(

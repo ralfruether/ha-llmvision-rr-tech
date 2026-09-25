@@ -3,6 +3,7 @@ from .timeline import Timeline
 from .providers import Request
 from .memory import Memory
 from .media_handlers import MediaProcessor
+from .stream_capture import PRO_FFMPEG_JPEG_Q, PRO_JPEG_OPTIONS
 import os, re
 from datetime import timedelta
 from homeassistant.util import dt as dt_util
@@ -66,6 +67,7 @@ from .const import (
     CLIP_PATH,
     RECORD_FPS,
     RECORD_SCALE,
+    FRAME_SOURCE,
     DATA_EXTRACTION_PROMPT,
     DEFAULT_OPENAI_MODEL,
     DEFAULT_ANTHROPIC_MODEL,
@@ -502,6 +504,7 @@ class ServiceCallData:
         self.clip_path: str = data_call.data.get(CLIP_PATH, "")
         self.record_fps = data_call.data.get(RECORD_FPS)
         self.record_scale = data_call.data.get(RECORD_SCALE)
+        self.frame_source = data_call.data.get(FRAME_SOURCE)
         self.structure: dict | None = data_call.data.get(STRUCTURE, None)
         self.title_field: str = data_call.data.get(TITLE_FIELD, "")
         self.description_field: str = data_call.data.get(DESCRIPTION_FIELD, "")
@@ -788,6 +791,8 @@ def setup(hass, config):
             temperature=call.temperature,
         )
         processor = MediaProcessor(hass, request)
+        processor.jpeg_options = PRO_JPEG_OPTIONS
+        processor.ffmpeg_jpeg_q = PRO_FFMPEG_JPEG_Q
 
         # Omitted max_frames means "analyze all extracted frames" (unbounded)
         max_frames = None if call.max_frames_raw is None else int(call.max_frames_raw)
@@ -879,6 +884,8 @@ def setup(hass, config):
             temperature=call.temperature,
         )
         processor = MediaProcessor(hass, request)
+        processor.jpeg_options = PRO_JPEG_OPTIONS
+        processor.ffmpeg_jpeg_q = PRO_FFMPEG_JPEG_Q
 
         # Omitted max_frames means "analyze all captured frames" (unbounded)
         max_frames = None if call.max_frames_raw is None else int(call.max_frames_raw)
@@ -897,6 +904,7 @@ def setup(hass, config):
             clip_path=call.clip_path,
             record_fps=call.record_fps,
             record_scale=call.record_scale,
+            frame_source=call.frame_source,
         )
 
         call.memory = Memory(hass)

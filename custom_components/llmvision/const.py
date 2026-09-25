@@ -91,6 +91,7 @@ DEBUG_POLYLINES = "debug_polylines"
 CLIP_PATH = "clip_path"
 RECORD_FPS = "record_fps"
 RECORD_SCALE = "record_scale"
+FRAME_SOURCE = "frame_source"
 
 # Error messages
 ERROR_NOT_CONFIGURED = "{provider} is not configured"
