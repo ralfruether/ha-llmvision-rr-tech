@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.7.2.13 - 2026-09-26
+
+### Fixed
+
+- Fixed `video_analyzer_pro` sending the selected key frame to the model without
+  the private-zone polylines. Every analyzed frame now carries the polylines,
+  including the frames written to `storage_path` and the `debug_polylines`
+  snapshots and debug information. The exposed key frame remains a clean copy.
+
 ## 1.7.2.12 - 2026-09-26
 
 ### Added

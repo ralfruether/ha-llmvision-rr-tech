@@ -1685,12 +1685,9 @@ class MediaProcessor:
             best_rest.sort(key=lambda x: x[2])
             selected_frames.extend(best_rest)
 
-            # Determine the key frame up front when polylines/storage/debug/expose
-            # need it. The key frame stays clean (no polylines).
+            # The key frame is only needed for the exposed image.
             key_idx = None
-            if selected_frames and (
-                expose_images or polylines or resolved_storage or debug_polylines
-            ):
+            if selected_frames and expose_images:
                 reference_bytes = selected_frames[0][0]
                 candidate_bytes = [fd for (fd, _, _) in selected_frames]
                 key_idx = await self._select_keyframe_index(
@@ -1699,11 +1696,11 @@ class MediaProcessor:
 
             video_base = os.path.splitext(os.path.basename(video_path))[0]
 
-            # Add frames to client (polylines on every analyzed frame except key)
+            # Every frame sent to the model carries the polylines.
             resized_base64 = []
             for i, (frame_data, _, _) in enumerate(selected_frames):
                 idx = i + 1
-                if polylines and i != key_idx:
+                if polylines:
                     resized_image, (fw, fh), resolved = (
                         await self._draw_polylines_on_image(
                             image_data=frame_data,
@@ -1746,7 +1743,7 @@ class MediaProcessor:
                             filename=filename,
                             image_data=resized_base64[i],
                         )
-                    if debug_polylines and polylines and i != key_idx:
+                    if debug_polylines and polylines:
                         await self._write_snapshot(
                             directory=self.snapshots_path,
                             filename=f"debug-{filename}",
@@ -1754,11 +1751,17 @@ class MediaProcessor:
                         )
 
             if expose_images and selected_frames and key_idx is not None:
-                # Expose the clean key frame
                 frame_idx_label = (selected_frames[key_idx][2] or 0) + 1
+                key_b64 = resized_base64[key_idx]
+                if polylines:
+                    # Expose a clean copy; the model's copy stays annotated.
+                    key_b64 = await self.resize_image(
+                        target_width=target_width,
+                        image_data=selected_frames[key_idx][0],
+                    )
                 await self._expose_image(
                     frame_name=str(frame_idx_label),
-                    image_data=resized_base64[key_idx],
+                    image_data=key_b64,
                     uid=str(uuid.uuid4())[:8],
                 )
         except Exception as e:

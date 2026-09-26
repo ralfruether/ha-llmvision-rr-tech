@@ -703,6 +703,105 @@ class TestMediaProcessor:
         processor._expose_image.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_add_video_annotates_model_keyframe_but_exposes_clean_copy(
+        self, processor
+    ):
+        """Every video frame sent to the model carries the polylines."""
+        processor.hass.loop.run_in_executor.side_effect = (
+            lambda _executor, func, *args: func(*args)
+        )
+        frame_bytes = [
+            _make_jpeg_bytes("black"),
+            _make_jpeg_bytes("gray"),
+            _make_jpeg_bytes("white"),
+        ]
+
+        class FakeStdout:
+            def __init__(self, chunks):
+                self._chunks = list(chunks)
+
+            async def read(self, _size):
+                if self._chunks:
+                    return self._chunks.pop(0)
+                return b""
+
+        class FakeProcess:
+            def __init__(self, payload):
+                self.pid = 1234
+                self.stdout = FakeStdout([payload, b""])
+                self.stderr = None
+                self.returncode = 0
+
+            async def wait(self):
+                return self.returncode
+
+        processor._similarity_score = Mock(return_value=0.5)
+        processor._select_keyframe_index = AsyncMock(return_value=1)
+        processor.resize_image = AsyncMock(wraps=processor.resize_image)
+        processor._write_snapshot = AsyncMock()
+        processor._expose_image = AsyncMock()
+        processor.debug_info = []
+
+        with patch(
+            "custom_components.llmvision.media_handlers.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=FakeProcess(b"".join(frame_bytes))),
+        ):
+            await processor.add_video(
+                video_path="/tmp/clip.mp4",
+                base_url="http://ha.local",
+                max_frames=3,
+                target_width=128,
+                include_filename=False,
+                expose_images=True,
+                polylines=[[(0.0, 0.5), (1.0, 0.5)]],
+                resolved_storage="/tmp/analysis",
+                debug_polylines=True,
+            )
+
+        model_images = [
+            call.kwargs["base64_image"]
+            for call in processor.client.add_frame.call_args_list
+        ]
+        assert len(model_images) == 3
+        for image_data in model_images:
+            image = Image.open(io.BytesIO(base64.b64decode(image_data)))
+            red, green, blue = image.getpixel(
+                (image.width // 2, image.height // 2)
+            )[:3]
+            assert red > 150 and green < 100 and blue < 100
+
+        assert [item["frame"] for item in processor.debug_info] == [
+            "clip frame 1",
+            "clip frame 2",
+            "clip frame 3",
+        ]
+        stored = [
+            call.kwargs["image_data"]
+            for call in processor._write_snapshot.await_args_list
+            if call.kwargs["directory"] == "/tmp/analysis"
+        ]
+        assert stored == model_images
+        debug_snapshots = [
+            call.kwargs["image_data"]
+            for call in processor._write_snapshot.await_args_list
+            if call.kwargs["filename"].startswith("debug-")
+        ]
+        assert debug_snapshots == model_images
+
+        selected_key_bytes = processor._select_keyframe_index.await_args.args[1][1]
+        processor.resize_image.assert_awaited_once_with(
+            target_width=128,
+            image_data=selected_key_bytes,
+        )
+        exposed_image_data = processor._expose_image.await_args.kwargs["image_data"]
+        exposed_image = Image.open(io.BytesIO(base64.b64decode(exposed_image_data)))
+        red, green, blue = exposed_image.getpixel(
+            (exposed_image.width // 2, exposed_image.height // 2)
+        )[:3]
+        assert abs(red - green) < 10
+        assert abs(green - blue) < 10
+
+    @pytest.mark.asyncio
     async def test_add_video_raises_when_http_download_is_empty(
         self, processor, tmp_path
     ):
