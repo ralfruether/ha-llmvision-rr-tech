@@ -677,6 +677,23 @@ stream_analyzer_pro:
         entity:
           domain: ["camera"]
           multiple: true
+    coalesce_while_recording:
+      name: Coalesce While Recording
+      required: false
+      description: 'For single-camera calls, allow at most one follow-up capture while recording is active. Additional calls return immediately as coalesced. The pending follow-up records only if a configured motion entity is still active after it obtains the camera lock.'
+      example: true
+      default: false
+      selector:
+        boolean:
+    motion_entity:
+      name: Motion Entity
+      required: false
+      description: 'Binary sensor entities used to recheck activity before a coalesced follow-up starts. Required when Coalesce While Recording is enabled.'
+      example: 'binary_sensor.front_door_motion'
+      selector:
+        entity:
+          domain: ["binary_sensor"]
+          multiple: true
     duration:
       name: Recording Duration
       required: true

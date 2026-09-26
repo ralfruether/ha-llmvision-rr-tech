@@ -310,6 +310,655 @@ class TestStreamAnalyzerProService:
 
         assert "debug" not in result
 
+    @pytest.mark.asyncio
+    async def test_same_camera_capture_is_serialized_but_provider_calls_overlap(self):
+        hass = _make_hass()
+        handlers = self._handlers(hass)
+        motion_state = Mock()
+        motion_state.state = "on"
+        hass.states = Mock()
+        hass.states.get = Mock(return_value=motion_state)
+
+        first_capture_started = asyncio.Event()
+        release_first_capture = asyncio.Event()
+        first_provider_started = asyncio.Event()
+        release_first_provider = asyncio.Event()
+        second_capture_started = asyncio.Event()
+
+        request_one = Mock()
+
+        async def call_first_provider(_call):
+            first_provider_started.set()
+            await release_first_provider.wait()
+            return {"response_text": "first"}
+
+        request_one.call = AsyncMock(side_effect=call_first_provider)
+        request_two = Mock()
+        request_two.call = AsyncMock(return_value={"response_text": "second"})
+
+        processor_one = Mock()
+        processor_one.key_frame = ""
+        processor_one.debug_info = None
+        processor_one.clip_paths = []
+        processor_one.clip_task = None
+
+        async def capture_first(**_kwargs):
+            first_capture_started.set()
+            await release_first_capture.wait()
+            return request_one
+
+        processor_one.add_streams = AsyncMock(side_effect=capture_first)
+
+        processor_two = Mock()
+        processor_two.key_frame = ""
+        processor_two.debug_info = None
+        processor_two.clip_paths = []
+        processor_two.clip_task = None
+
+        async def capture_second(**_kwargs):
+            second_capture_started.set()
+            return request_two
+
+        processor_two.add_streams = AsyncMock(side_effect=capture_second)
+
+        call_one = ServiceCallData(
+            _build_data_call(
+                {
+                    "provider": "e",
+                    "message": "first",
+                    "image_entity": ["camera.front"],
+                    "coalesce_while_recording": True,
+                    "motion_entity": ["binary_sensor.front_motion"],
+                }
+            )
+        )
+        call_two = ServiceCallData(
+            _build_data_call(
+                {
+                    "provider": "e",
+                    "message": "second",
+                    "image_entity": ["camera.front"],
+                    "coalesce_while_recording": True,
+                    "motion_entity": ["binary_sensor.front_motion"],
+                }
+            )
+        )
+        memories = [Mock(), Mock()]
+        for memory in memories:
+            memory._update_memory = AsyncMock()
+
+        with (
+            patch(
+                "custom_components.llmvision.ServiceCallData",
+                side_effect=[call_one, call_two],
+            ),
+            patch(
+                "custom_components.llmvision.MediaProcessor",
+                side_effect=[processor_one, processor_two],
+            ),
+            patch(
+                "custom_components.llmvision.Memory",
+                side_effect=memories,
+            ),
+            patch("custom_components.llmvision.Request", side_effect=[request_one, request_two]),
+            patch("custom_components.llmvision._create_event", new=AsyncMock()),
+        ):
+            first_task = asyncio.create_task(
+                handlers["stream_analyzer_pro"](_build_data_call({}))
+            )
+            await first_capture_started.wait()
+
+            second_task = asyncio.create_task(
+                handlers["stream_analyzer_pro"](_build_data_call({}))
+            )
+            await asyncio.sleep(0)
+            assert not second_capture_started.is_set()
+
+            release_first_capture.set()
+            await first_provider_started.wait()
+            await asyncio.wait_for(second_capture_started.wait(), timeout=0.1)
+            assert not first_task.done()
+
+            release_first_provider.set()
+            first_result, second_result = await asyncio.gather(first_task, second_task)
+
+        assert first_result["response_text"] == "first"
+        assert second_result["response_text"] == "second"
+        assert first_result["capture"]["status"] == "completed"
+        assert second_result["capture"]["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_busy_calls_coalesce_and_skip_pending_capture_when_motion_ends(self):
+        hass = _make_hass()
+        handlers = self._handlers(hass)
+        motion_state = Mock()
+        motion_state.state = "on"
+        hass.states = Mock()
+        hass.states.get = Mock(return_value=motion_state)
+
+        first_capture_started = asyncio.Event()
+        release_first_capture = asyncio.Event()
+        request_obj = Mock()
+        request_obj.call = AsyncMock(return_value={"response_text": "first"})
+
+        processor_one = Mock()
+        processor_one.key_frame = ""
+        processor_one.debug_info = None
+        processor_one.clip_paths = []
+        processor_one.clip_task = None
+
+        async def capture_first(**_kwargs):
+            first_capture_started.set()
+            await release_first_capture.wait()
+            return request_obj
+
+        processor_one.add_streams = AsyncMock(side_effect=capture_first)
+
+        processor_two = Mock()
+        processor_two.clip_task = None
+        processor_two.add_streams = AsyncMock()
+        processor_three = Mock()
+        processor_three.clip_task = None
+        processor_three.add_streams = AsyncMock()
+
+        call_data = {
+            "provider": "e",
+            "message": "m",
+            "image_entity": ["camera.front"],
+            "coalesce_while_recording": True,
+            "motion_entity": ["binary_sensor.front_motion"],
+        }
+        calls = [
+            ServiceCallData(_build_data_call(call_data)),
+            ServiceCallData(_build_data_call(call_data)),
+            ServiceCallData(_build_data_call(call_data)),
+        ]
+        memory_obj = Mock()
+        memory_obj._update_memory = AsyncMock()
+
+        with (
+            patch("custom_components.llmvision.ServiceCallData", side_effect=calls),
+            patch(
+                "custom_components.llmvision.MediaProcessor",
+                side_effect=[processor_one, processor_two, processor_three],
+            ),
+            patch("custom_components.llmvision.Request", return_value=request_obj),
+            patch("custom_components.llmvision.Memory", return_value=memory_obj),
+            patch("custom_components.llmvision._create_event", new=AsyncMock()),
+        ):
+            first_task = asyncio.create_task(
+                handlers["stream_analyzer_pro"](_build_data_call({}))
+            )
+            await first_capture_started.wait()
+            pending_task = asyncio.create_task(
+                handlers["stream_analyzer_pro"](_build_data_call({}))
+            )
+            await asyncio.sleep(0)
+
+            coalesced = await handlers["stream_analyzer_pro"](_build_data_call({}))
+            assert coalesced["capture"]["status"] == "coalesced"
+            assert coalesced["capture"]["reason"] == "pending_follow_up_exists"
+
+            motion_state.state = "off"
+            release_first_capture.set()
+            first_result, pending_result = await asyncio.gather(
+                first_task, pending_task
+            )
+
+        assert first_result["capture"]["status"] == "completed"
+        assert pending_result["capture"]["status"] == "skipped"
+        assert pending_result["capture"]["reason"] == "motion_inactive"
+        assert pending_result["capture"]["request_id"]
+        processor_two.add_streams.assert_not_awaited()
+        processor_three.add_streams.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("image_entities", "motion_entities", "message"),
+        [
+            (
+                ["camera.front", "camera.back"],
+                ["binary_sensor.front_motion"],
+                "exactly one camera",
+            ),
+            (["camera.front"], [], "motion_entity"),
+            (["camera.front"], ["sensor.front_motion"], "motion_entity"),
+        ],
+    )
+    async def test_invalid_coalescing_configuration_raises(
+        self, image_entities, motion_entities, message
+    ):
+        hass = _make_hass()
+        handlers = self._handlers(hass)
+        call_obj = ServiceCallData(
+            _build_data_call(
+                {
+                    "provider": "e",
+                    "message": "m",
+                    "image_entity": image_entities,
+                    "coalesce_while_recording": True,
+                    "motion_entity": motion_entities,
+                }
+            )
+        )
+
+        with patch(
+            "custom_components.llmvision.ServiceCallData", return_value=call_obj
+        ):
+            with pytest.raises(ServiceValidationError, match=message):
+                await handlers["stream_analyzer_pro"](_build_data_call({}))
+
+    @pytest.mark.asyncio
+    async def test_cancelling_pending_owner_releases_coalescing_slot(self):
+        hass = _make_hass()
+        handlers = self._handlers(hass)
+        motion_state = Mock()
+        motion_state.state = "on"
+        hass.states = Mock()
+        hass.states.get = Mock(return_value=motion_state)
+
+        first_capture_started = asyncio.Event()
+        release_first_capture = asyncio.Event()
+        replacement_capture_started = asyncio.Event()
+        request_obj = Mock()
+        request_obj.call = AsyncMock(return_value={"response_text": "ok"})
+
+        processor_one = Mock()
+        processor_one.key_frame = ""
+        processor_one.debug_info = None
+        processor_one.clip_paths = []
+        processor_one.clip_task = None
+
+        async def capture_first(**_kwargs):
+            first_capture_started.set()
+            await release_first_capture.wait()
+            return request_obj
+
+        processor_one.add_streams = AsyncMock(side_effect=capture_first)
+
+        processor_two = Mock()
+        processor_two.clip_task = None
+        processor_two.add_streams = AsyncMock()
+
+        processor_three = Mock()
+        processor_three.key_frame = ""
+        processor_three.debug_info = None
+        processor_three.clip_paths = []
+        processor_three.clip_task = None
+
+        async def capture_replacement(**_kwargs):
+            replacement_capture_started.set()
+            return request_obj
+
+        processor_three.add_streams = AsyncMock(side_effect=capture_replacement)
+
+        call_data = {
+            "provider": "e",
+            "message": "m",
+            "image_entity": ["camera.front"],
+            "coalesce_while_recording": True,
+            "motion_entity": ["binary_sensor.front_motion"],
+        }
+        calls = [
+            ServiceCallData(_build_data_call(call_data)),
+            ServiceCallData(_build_data_call(call_data)),
+            ServiceCallData(_build_data_call(call_data)),
+        ]
+        memories = [Mock(), Mock()]
+        for memory in memories:
+            memory._update_memory = AsyncMock()
+
+        with (
+            patch("custom_components.llmvision.ServiceCallData", side_effect=calls),
+            patch(
+                "custom_components.llmvision.MediaProcessor",
+                side_effect=[processor_one, processor_two, processor_three],
+            ),
+            patch("custom_components.llmvision.Request", return_value=request_obj),
+            patch("custom_components.llmvision.Memory", side_effect=memories),
+            patch("custom_components.llmvision._create_event", new=AsyncMock()),
+        ):
+            first_task = asyncio.create_task(
+                handlers["stream_analyzer_pro"](_build_data_call({}))
+            )
+            await first_capture_started.wait()
+
+            pending_task = asyncio.create_task(
+                handlers["stream_analyzer_pro"](_build_data_call({}))
+            )
+            await asyncio.sleep(0)
+            pending_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pending_task
+
+            replacement_task = asyncio.create_task(
+                handlers["stream_analyzer_pro"](_build_data_call({}))
+            )
+            await asyncio.sleep(0)
+            assert not replacement_task.done()
+
+            release_first_capture.set()
+            await asyncio.wait_for(replacement_capture_started.wait(), timeout=0.1)
+            first_result, replacement_result = await asyncio.gather(
+                first_task, replacement_task
+            )
+
+        assert first_result["capture"]["status"] == "completed"
+        assert replacement_result["capture"]["status"] == "completed"
+        processor_two.add_streams.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_different_camera_captures_can_overlap(self):
+        hass = _make_hass()
+        handlers = self._handlers(hass)
+
+        first_capture_started = asyncio.Event()
+        release_first_capture = asyncio.Event()
+        second_capture_started = asyncio.Event()
+
+        request_one = Mock()
+        request_one.call = AsyncMock(return_value={"response_text": "first"})
+        request_two = Mock()
+        request_two.call = AsyncMock(return_value={"response_text": "second"})
+
+        processor_one = Mock()
+        processor_one.key_frame = ""
+        processor_one.debug_info = None
+        processor_one.clip_paths = []
+        processor_one.clip_task = None
+
+        async def capture_first(**_kwargs):
+            first_capture_started.set()
+            await release_first_capture.wait()
+            return request_one
+
+        processor_one.add_streams = AsyncMock(side_effect=capture_first)
+
+        processor_two = Mock()
+        processor_two.key_frame = ""
+        processor_two.debug_info = None
+        processor_two.clip_paths = []
+        processor_two.clip_task = None
+
+        async def capture_second(**_kwargs):
+            second_capture_started.set()
+            return request_two
+
+        processor_two.add_streams = AsyncMock(side_effect=capture_second)
+
+        calls = [
+            ServiceCallData(
+                _build_data_call(
+                    {
+                        "provider": "e",
+                        "message": "first",
+                        "image_entity": ["camera.front"],
+                    }
+                )
+            ),
+            ServiceCallData(
+                _build_data_call(
+                    {
+                        "provider": "e",
+                        "message": "second",
+                        "image_entity": ["camera.back"],
+                    }
+                )
+            ),
+        ]
+        memories = [Mock(), Mock()]
+        for memory in memories:
+            memory._update_memory = AsyncMock()
+
+        with (
+            patch("custom_components.llmvision.ServiceCallData", side_effect=calls),
+            patch(
+                "custom_components.llmvision.MediaProcessor",
+                side_effect=[processor_one, processor_two],
+            ),
+            patch("custom_components.llmvision.Memory", side_effect=memories),
+            patch("custom_components.llmvision.Request", side_effect=[request_one, request_two]),
+            patch("custom_components.llmvision._create_event", new=AsyncMock()),
+        ):
+            first_task = asyncio.create_task(
+                handlers["stream_analyzer_pro"](_build_data_call({}))
+            )
+            await first_capture_started.wait()
+            second_task = asyncio.create_task(
+                handlers["stream_analyzer_pro"](_build_data_call({}))
+            )
+
+            await asyncio.wait_for(second_capture_started.wait(), timeout=0.1)
+            release_first_capture.set()
+            await asyncio.gather(first_task, second_task)
+
+    @pytest.mark.asyncio
+    async def test_duplicate_camera_entities_are_captured_once(self):
+        hass = _make_hass()
+        handlers = self._handlers(hass)
+
+        call_obj = ServiceCallData(
+            _build_data_call(
+                {
+                    "provider": "e",
+                    "message": "m",
+                    "image_entity": ["camera.front", "camera.front"],
+                }
+            )
+        )
+        request_obj = Mock()
+        request_obj.call = AsyncMock(return_value={"response_text": "ok"})
+        memory_obj = Mock()
+        memory_obj._update_memory = AsyncMock()
+        processor = Mock()
+        processor.key_frame = ""
+        processor.debug_info = None
+        processor.clip_paths = []
+        processor.clip_task = None
+        processor.add_streams = AsyncMock(return_value=request_obj)
+
+        with (
+            patch("custom_components.llmvision.ServiceCallData", return_value=call_obj),
+            patch("custom_components.llmvision.Request", return_value=request_obj),
+            patch("custom_components.llmvision.MediaProcessor", return_value=processor),
+            patch("custom_components.llmvision.Memory", return_value=memory_obj),
+            patch("custom_components.llmvision._create_event", new=AsyncMock()),
+        ):
+            await handlers["stream_analyzer_pro"](_build_data_call({}))
+
+        assert processor.add_streams.await_args.kwargs["image_entities"] == [
+            "camera.front"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_clip_finalization_holds_same_camera_lock(self):
+        hass = _make_hass()
+        handlers = self._handlers(hass)
+
+        clip_started = asyncio.Event()
+        release_clip = asyncio.Event()
+        second_capture_started = asyncio.Event()
+
+        request_one = Mock()
+        request_one.call = AsyncMock(return_value={"response_text": "first"})
+        request_two = Mock()
+        request_two.call = AsyncMock(return_value={"response_text": "second"})
+
+        processor_one = Mock()
+        processor_one.key_frame = ""
+        processor_one.debug_info = None
+        processor_one.clip_paths = []
+        processor_one.clip_task = None
+
+        async def finish_clip():
+            clip_started.set()
+            await release_clip.wait()
+
+        async def capture_first(**_kwargs):
+            processor_one.clip_task = asyncio.create_task(finish_clip())
+            return request_one
+
+        processor_one.add_streams = AsyncMock(side_effect=capture_first)
+
+        processor_two = Mock()
+        processor_two.key_frame = ""
+        processor_two.debug_info = None
+        processor_two.clip_paths = []
+        processor_two.clip_task = None
+
+        async def capture_second(**_kwargs):
+            second_capture_started.set()
+            return request_two
+
+        processor_two.add_streams = AsyncMock(side_effect=capture_second)
+
+        calls = [
+            ServiceCallData(
+                _build_data_call(
+                    {
+                        "provider": "e",
+                        "message": "first",
+                        "image_entity": ["camera.front"],
+                    }
+                )
+            ),
+            ServiceCallData(
+                _build_data_call(
+                    {
+                        "provider": "e",
+                        "message": "second",
+                        "image_entity": ["camera.front"],
+                    }
+                )
+            ),
+        ]
+        memories = [Mock(), Mock()]
+        for memory in memories:
+            memory._update_memory = AsyncMock()
+
+        with (
+            patch("custom_components.llmvision.ServiceCallData", side_effect=calls),
+            patch(
+                "custom_components.llmvision.MediaProcessor",
+                side_effect=[processor_one, processor_two],
+            ),
+            patch("custom_components.llmvision.Memory", side_effect=memories),
+            patch(
+                "custom_components.llmvision.Request",
+                side_effect=[request_one, request_two],
+            ),
+            patch("custom_components.llmvision._create_event", new=AsyncMock()),
+        ):
+            first_task = asyncio.create_task(
+                handlers["stream_analyzer_pro"](_build_data_call({}))
+            )
+            await clip_started.wait()
+            second_task = asyncio.create_task(
+                handlers["stream_analyzer_pro"](_build_data_call({}))
+            )
+            await asyncio.sleep(0)
+            assert not second_capture_started.is_set()
+
+            release_clip.set()
+            await asyncio.wait_for(second_capture_started.wait(), timeout=0.1)
+            await asyncio.gather(first_task, second_task)
+
+    @pytest.mark.asyncio
+    async def test_cancellation_stops_clip_before_releasing_lock(self):
+        hass = _make_hass()
+        handlers = self._handlers(hass)
+
+        clip_started = asyncio.Event()
+        clip_stopped = asyncio.Event()
+        second_capture_started = asyncio.Event()
+
+        request_one = Mock()
+        request_one.call = AsyncMock(return_value={"response_text": "first"})
+        request_two = Mock()
+        request_two.call = AsyncMock(return_value={"response_text": "second"})
+
+        processor_one = Mock()
+        processor_one.key_frame = ""
+        processor_one.debug_info = None
+        processor_one.clip_paths = []
+        processor_one.clip_task = None
+
+        async def record_clip_until_cancelled():
+            clip_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                clip_stopped.set()
+
+        async def capture_first(**_kwargs):
+            processor_one.clip_task = asyncio.create_task(
+                record_clip_until_cancelled()
+            )
+            return request_one
+
+        processor_one.add_streams = AsyncMock(side_effect=capture_first)
+
+        processor_two = Mock()
+        processor_two.key_frame = ""
+        processor_two.debug_info = None
+        processor_two.clip_paths = []
+        processor_two.clip_task = None
+
+        async def capture_second(**_kwargs):
+            second_capture_started.set()
+            return request_two
+
+        processor_two.add_streams = AsyncMock(side_effect=capture_second)
+
+        calls = [
+            ServiceCallData(
+                _build_data_call(
+                    {
+                        "provider": "e",
+                        "message": "first",
+                        "image_entity": ["camera.front"],
+                    }
+                )
+            ),
+            ServiceCallData(
+                _build_data_call(
+                    {
+                        "provider": "e",
+                        "message": "second",
+                        "image_entity": ["camera.front"],
+                    }
+                )
+            ),
+        ]
+        memories = [Mock(), Mock()]
+        for memory in memories:
+            memory._update_memory = AsyncMock()
+
+        with (
+            patch("custom_components.llmvision.ServiceCallData", side_effect=calls),
+            patch(
+                "custom_components.llmvision.MediaProcessor",
+                side_effect=[processor_one, processor_two],
+            ),
+            patch("custom_components.llmvision.Memory", side_effect=memories),
+            patch(
+                "custom_components.llmvision.Request",
+                side_effect=[request_one, request_two],
+            ),
+            patch("custom_components.llmvision._create_event", new=AsyncMock()),
+        ):
+            first_task = asyncio.create_task(
+                handlers["stream_analyzer_pro"](_build_data_call({}))
+            )
+            await clip_started.wait()
+            first_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first_task
+            assert clip_stopped.is_set()
+
+            await handlers["stream_analyzer_pro"](_build_data_call({}))
+            assert second_capture_started.is_set()
+
 
 class TestAddVideosProWiring:
     @pytest.mark.asyncio
@@ -710,4 +1359,3 @@ class TestClipRecording:
             )
 
         assert result["clip"] == "/media/llmvision/clips/pending.mp4"
-

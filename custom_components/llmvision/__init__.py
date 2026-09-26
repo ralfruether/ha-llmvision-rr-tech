@@ -1,4 +1,6 @@
 from datetime import datetime
+import asyncio
+from uuid import uuid4
 from .timeline import Timeline
 from .providers import Request
 from .memory import Memory
@@ -68,6 +70,8 @@ from .const import (
     RECORD_FPS,
     RECORD_SCALE,
     FRAME_SOURCE,
+    COALESCE_WHILE_RECORDING,
+    MOTION_ENTITY,
     DATA_EXTRACTION_PROMPT,
     DEFAULT_OPENAI_MODEL,
     DEFAULT_ANTHROPIC_MODEL,
@@ -505,6 +509,13 @@ class ServiceCallData:
         self.record_fps = data_call.data.get(RECORD_FPS)
         self.record_scale = data_call.data.get(RECORD_SCALE)
         self.frame_source = data_call.data.get(FRAME_SOURCE)
+        self.coalesce_while_recording: bool = data_call.data.get(
+            COALESCE_WHILE_RECORDING, False
+        )
+        motion_entities = data_call.data.get(MOTION_ENTITY)
+        self.motion_entities = (
+            [motion_entities] if isinstance(motion_entities, str) else motion_entities or []
+        )
         self.structure: dict | None = data_call.data.get(STRUCTURE, None)
         self.title_field: str = data_call.data.get(TITLE_FIELD, "")
         self.description_field: str = data_call.data.get(DESCRIPTION_FIELD, "")
@@ -691,6 +702,47 @@ async def _update_sensor(hass, sensor_entity: str, value: str | int, type: str) 
 
 
 def setup(hass, config):
+    stream_capture_locks = {}
+    pending_stream_captures = {}
+
+    async def acquire_stream_capture_locks(
+        image_entities, coalesce_while_recording=False
+    ):
+        request_id = uuid4().hex
+        pending_entity = None
+        locks = [
+            stream_capture_locks.setdefault(entity_id, asyncio.Lock())
+            for entity_id in sorted(set(image_entities or []))
+        ]
+        if coalesce_while_recording and locks[0].locked():
+            camera_entity = image_entities[0]
+            pending_request_id = pending_stream_captures.get(camera_entity)
+            if pending_request_id is not None:
+                return [], request_id, False, pending_request_id
+            pending_stream_captures[camera_entity] = request_id
+            pending_entity = camera_entity
+
+        acquired = []
+        try:
+            for lock in locks:
+                await lock.acquire()
+                acquired.append(lock)
+        except BaseException:
+            for lock in reversed(acquired):
+                lock.release()
+            raise
+        finally:
+            if (
+                pending_entity is not None
+                and pending_stream_captures.get(pending_entity) == request_id
+            ):
+                pending_stream_captures.pop(pending_entity)
+        return acquired, request_id, pending_entity is not None, None
+
+    def release_stream_capture_locks(locks):
+        for lock in reversed(locks):
+            lock.release()
+
     async def image_analyzer(data_call):
         """Handle the service call to analyze an image with LLM Vision"""
         start = dt_util.now()
@@ -889,28 +941,106 @@ def setup(hass, config):
 
         # Omitted max_frames means "analyze all captured frames" (unbounded)
         max_frames = None if call.max_frames_raw is None else int(call.max_frames_raw)
+        image_entities = list(dict.fromkeys(call.image_entities or []))
+        if call.coalesce_while_recording:
+            if len(image_entities) != 1:
+                raise ServiceValidationError(
+                    "coalesce_while_recording requires exactly one camera entity"
+                )
+            if not call.motion_entities or any(
+                not isinstance(entity_id, str)
+                or not entity_id.startswith("binary_sensor.")
+                for entity_id in call.motion_entities
+            ):
+                raise ServiceValidationError(
+                    "coalesce_while_recording requires at least one binary_sensor "
+                    "motion_entity"
+                )
 
-        request = await processor.add_streams(
-            image_entities=call.image_entities,
-            duration=call.duration,
-            max_frames=max_frames,
-            target_width=call.target_width,
-            include_filename=call.include_filename,
-            expose_images=call.expose_images,
-            fps=call.fps,
-            polylines=call.polylines,
-            storage_path=call.storage_path,
-            debug_polylines=call.debug_polylines,
-            clip_path=call.clip_path,
-            record_fps=call.record_fps,
-            record_scale=call.record_scale,
-            frame_source=call.frame_source,
+        (
+            capture_locks,
+            capture_request_id,
+            waited_for_capture,
+            pending_request_id,
+        ) = await acquire_stream_capture_locks(
+            image_entities, call.coalesce_while_recording
         )
+        if pending_request_id is not None:
+            return {
+                "capture": {
+                    "status": "coalesced",
+                    "reason": "pending_follow_up_exists",
+                    "request_id": capture_request_id,
+                    "follow_up_request_id": pending_request_id,
+                }
+            }
+
+        try:
+            if waited_for_capture:
+                motion_states = [
+                    hass.states.get(entity_id) for entity_id in call.motion_entities
+                ]
+                if not any(
+                    state is not None and state.state == "on"
+                    for state in motion_states
+                ):
+                    reason = (
+                        "motion_state_unavailable"
+                        if any(
+                            state is None
+                            or state.state in ("unknown", "unavailable")
+                            for state in motion_states
+                        )
+                        else "motion_inactive"
+                    )
+                    return {
+                        "capture": {
+                            "status": "skipped",
+                            "reason": reason,
+                            "request_id": capture_request_id,
+                        }
+                    }
+
+            request = await processor.add_streams(
+                image_entities=image_entities,
+                duration=call.duration,
+                max_frames=max_frames,
+                target_width=call.target_width,
+                include_filename=call.include_filename,
+                expose_images=call.expose_images,
+                fps=call.fps,
+                polylines=call.polylines,
+                storage_path=call.storage_path,
+                debug_polylines=call.debug_polylines,
+                clip_path=call.clip_path,
+                record_fps=call.record_fps,
+                record_scale=call.record_scale,
+                frame_source=call.frame_source,
+            )
+            clip_task = getattr(processor, "clip_task", None)
+            if asyncio.isfuture(clip_task):
+                await clip_task
+        except BaseException:
+            clip_task = getattr(processor, "clip_task", None)
+            if asyncio.isfuture(clip_task) and not clip_task.done():
+                clip_task.cancel()
+                try:
+                    await clip_task
+                except asyncio.CancelledError:
+                    pass
+            raise
+        finally:
+            release_stream_capture_locks(capture_locks)
 
         call.memory = Memory(hass)
         await call.memory._update_memory()
 
         response = await request.call(call)
+        if call.coalesce_while_recording:
+            response["capture"] = {
+                "status": "completed",
+                "request_id": capture_request_id,
+            }
         # Add processor.key_frame to response if it exists
         if processor.key_frame:
             response["key_frame"] = processor.key_frame

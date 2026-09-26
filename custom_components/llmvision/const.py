@@ -92,6 +92,8 @@ CLIP_PATH = "clip_path"
 RECORD_FPS = "record_fps"
 RECORD_SCALE = "record_scale"
 FRAME_SOURCE = "frame_source"
+COALESCE_WHILE_RECORDING = "coalesce_while_recording"
+MOTION_ENTITY = "motion_entity"
 
 # Error messages
 ERROR_NOT_CONFIGURED = "{provider} is not configured"
