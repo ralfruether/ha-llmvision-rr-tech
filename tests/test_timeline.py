@@ -4,7 +4,7 @@ import datetime
 import os
 import uuid
 from functools import partial
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import aiosqlite
 import pytest
@@ -13,11 +13,14 @@ from custom_components.llmvision.const import (
     CONF_RETENTION_TIME,
     CONF_TIMELINE_LANGUAGE,
 )
+from custom_components.llmvision.media_handlers import MediaProcessor
 from custom_components.llmvision.timeline import (
     DB_VERSION,
     Event,
     Timeline,
     _get_category_and_label,
+    mark_key_frame_pending,
+    release_key_frame,
 )
 from homeassistant.util import dt as dt_util
 
@@ -1079,6 +1082,83 @@ class TestCleanup:
         tl._migrating = False
         await tl._cleanup()
         assert pending.exists()
+
+    async def test_cleanup_from_other_timeline_protects_in_flight_key_frame(
+        self, build_timeline, tmp_path
+    ):
+        """A request's key frame must survive cleanup started by another Timeline."""
+        requesting = build_timeline()
+        other = Timeline(requesting.hass, requesting._config_entry)
+        other._migrating = False
+        await other._initialize_db()
+        media_path = tmp_path / "snapshots"
+        media_path.mkdir()
+        other._media_path = str(media_path)
+
+        in_flight = media_path / "811e3db0-einfahrt_hochauflosung.jpg"
+        in_flight.write_bytes(b"fake")
+        old_ts = datetime.datetime.now().timestamp() - 100
+        os.utime(str(in_flight), (old_ts, old_ts))
+
+        key_frame = "/media/llmvision/snapshots/811e3db0-einfahrt_hochauflosung.jpg"
+        mark_key_frame_pending(requesting.hass, key_frame)
+        assert other._pending_key_frames is requesting._pending_key_frames
+        assert other._cleanup_lock is requesting._cleanup_lock
+
+        await other._cleanup()
+        assert in_flight.exists()
+
+        release_key_frame(requesting.hass, key_frame)
+        await other._cleanup()
+        assert not in_flight.exists()
+
+    async def test_analyzer_key_frame_survives_concurrent_cleanup_end_to_end(
+        self, build_timeline, tmp_path
+    ):
+        """Reproduces the Pushover ENOENT: another timeline cleans up mid-request."""
+        requesting = build_timeline()
+        await requesting._initialize_db()
+        other = Timeline(requesting.hass, requesting._config_entry)
+        other._migrating = False
+        media_path = tmp_path / "snapshots"
+        media_path.mkdir()
+        other._media_path = str(media_path)
+
+        with patch(
+            "custom_components.llmvision.media_handlers.async_get_clientsession"
+        ):
+            processor = MediaProcessor(requesting.hass, Mock())
+
+        old_ts = datetime.datetime.now().timestamp() - 100
+
+        async def save_to_media(image_data=None, image_path=None, **kwargs):
+            written = media_path / os.path.basename(image_path)
+            written.write_bytes(b"jpeg")
+            os.utime(str(written), (old_ts, old_ts))
+
+        processor._save_clip = save_to_media
+        await processor._expose_image(
+            frame_name="einfahrt_hochauflosung", image_data="data", uid="811e3db0"
+        )
+        snapshot = media_path / os.path.basename(processor.key_frame)
+
+        # Cleanup triggered elsewhere while the model call is still running.
+        await other._cleanup()
+        assert snapshot.exists()
+
+        now = dt_util.utcnow()
+        await requesting.create_event(
+            start=now,
+            end=now + datetime.timedelta(minutes=1),
+            title="Person",
+            description="",
+            key_frame=processor.key_frame,
+            camera_name="camera.einfahrt",
+        )
+        processor.release_key_frame()
+
+        await other._cleanup()
+        assert snapshot.exists()
 
     async def test_cleanup_protects_new_files_within_grace_period(
         self, build_timeline, tmp_path

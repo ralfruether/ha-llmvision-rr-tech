@@ -264,13 +264,20 @@ class TestStreamAnalyzerProService:
         processor.debug_info = [{"frame": "f", "width": 10, "height": 10, "polylines": []}]
         processor.clip_paths = []
         processor.add_streams = AsyncMock(return_value=request_obj)
+        released_before_event = []
+
+        async def record_event(**kwargs):
+            released_before_event.append(processor.release_key_frame.called)
 
         with (
             patch("custom_components.llmvision.ServiceCallData", return_value=call_obj),
             patch("custom_components.llmvision.Request", return_value=request_obj),
             patch("custom_components.llmvision.MediaProcessor", return_value=processor),
             patch("custom_components.llmvision.Memory", return_value=memory_obj),
-            patch("custom_components.llmvision._create_event", new=AsyncMock()),
+            patch(
+                "custom_components.llmvision._create_event",
+                new=AsyncMock(side_effect=record_event),
+            ),
         ):
             result = await handlers["stream_analyzer_pro"](
                 _build_data_call({"provider": "e", "message": "m"})
@@ -278,6 +285,9 @@ class TestStreamAnalyzerProService:
 
         assert result["key_frame"] == "frame.jpg"
         assert result["debug"] == processor.debug_info
+        # The key frame stays protected until its timeline event is saved.
+        assert released_before_event == [False]
+        processor.release_key_frame.assert_called_once_with()
 
     @pytest.mark.asyncio
     async def test_handler_omits_debug_when_none(self):

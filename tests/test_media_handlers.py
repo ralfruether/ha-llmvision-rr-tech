@@ -7,6 +7,7 @@ import base64
 from types import SimpleNamespace
 from homeassistant.exceptions import ServiceValidationError
 from custom_components.llmvision.media_handlers import MediaProcessor
+from custom_components.llmvision.timeline import _shared_cleanup_state
 
 
 def _make_jpeg_bytes(color):
@@ -69,6 +70,7 @@ class TestMediaProcessor:
     def mock_hass(self):
         """Create a mock Home Assistant instance."""
         hass = Mock()
+        hass.data = {}
         hass.loop = Mock()
         hass.loop.run_in_executor = AsyncMock()
         hass.states = Mock()
@@ -152,6 +154,27 @@ class TestMediaProcessor:
 
         assert processor.key_frame.endswith("deadbeef-7.jpg")
         processor._save_clip.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_expose_image_protects_key_frame_until_released(self, processor):
+        """The key frame must be protected from cleanup before it is written."""
+        pending, _lock = _shared_cleanup_state(processor.hass)
+        pending_at_write = []
+
+        async def fake_save_clip(**kwargs):
+            pending_at_write.append(set(pending))
+
+        processor._save_clip = AsyncMock(side_effect=fake_save_clip)
+
+        await processor._expose_image(
+            frame_name="einfahrt_hochauflosung", image_data="data", uid="811e3db0"
+        )
+
+        assert pending_at_write == [{"811e3db0-einfahrt_hochauflosung.jpg"}]
+        assert pending == {"811e3db0-einfahrt_hochauflosung.jpg"}
+
+        processor.release_key_frame()
+        assert pending == set()
 
     @pytest.mark.asyncio
     async def test_select_keyframe_index_picks_lowest_similarity(self, processor):

@@ -763,34 +763,37 @@ def setup(hass, config):
         )
         # Fetch and preprocess images
         processor = MediaProcessor(hass, request)
-        # Send images to RequestHandler client
-        request = await processor.add_images(
-            image_entities=call.image_entities,
-            image_paths=call.image_paths,
-            target_width=call.target_width,
-            include_filename=call.include_filename,
-            expose_images=call.expose_images,
-        )
+        try:
+            # Send images to RequestHandler client
+            request = await processor.add_images(
+                image_entities=call.image_entities,
+                image_paths=call.image_paths,
+                target_width=call.target_width,
+                include_filename=call.include_filename,
+                expose_images=call.expose_images,
+            )
 
-        call.memory = Memory(hass)
-        await call.memory._update_memory()
+            call.memory = Memory(hass)
+            await call.memory._update_memory()
 
-        # Validate configuration, input data and make the call
-        response = await request.call(call)
-        _LOGGER.info(f"Response: {response}")
-        # Add processor.key_frame to response if it exists
-        if processor.key_frame:
-            _LOGGER.info(f"Key frame: {processor.key_frame}")
-            response["key_frame"] = processor.key_frame
+            # Validate configuration, input data and make the call
+            response = await request.call(call)
+            _LOGGER.info(f"Response: {response}")
+            # Add processor.key_frame to response if it exists
+            if processor.key_frame:
+                _LOGGER.info(f"Key frame: {processor.key_frame}")
+                response["key_frame"] = processor.key_frame
 
-        await _create_event(
-            hass=hass,
-            call=call,  # type: ignore
-            start=start,
-            response=response,
-            key_frame=processor.key_frame,
-        )
-        return response
+            await _create_event(
+                hass=hass,
+                call=call,  # type: ignore
+                start=start,
+                response=response,
+                key_frame=processor.key_frame,
+            )
+            return response
+        finally:
+            processor.release_key_frame()
 
     async def video_analyzer(data_call):
         """Handle the service call to analyze a video (future implementation)"""
@@ -805,30 +808,33 @@ def setup(hass, config):
             temperature=call.temperature,
         )
         processor = MediaProcessor(hass, request)
-        request = await processor.add_videos(
-            video_paths=call.video_paths,
-            event_ids=call.event_id,
-            max_frames=call.max_frames,
-            target_width=call.target_width,
-            include_filename=call.include_filename,
-            expose_images=call.expose_images,
-        )
-        call.memory = Memory(hass)
-        await call.memory._update_memory()
+        try:
+            request = await processor.add_videos(
+                video_paths=call.video_paths,
+                event_ids=call.event_id,
+                max_frames=call.max_frames,
+                target_width=call.target_width,
+                include_filename=call.include_filename,
+                expose_images=call.expose_images,
+            )
+            call.memory = Memory(hass)
+            await call.memory._update_memory()
 
-        response = await request.call(call)
-        # Add processor.key_frame to response if it exists
-        if processor.key_frame:
-            response["key_frame"] = processor.key_frame
+            response = await request.call(call)
+            # Add processor.key_frame to response if it exists
+            if processor.key_frame:
+                response["key_frame"] = processor.key_frame
 
-        await _create_event(
-            hass=hass,
-            call=call,  # type: ignore
-            start=start,
-            response=response,
-            key_frame=processor.key_frame,
-        )
-        return response
+            await _create_event(
+                hass=hass,
+                call=call,  # type: ignore
+                start=start,
+                response=response,
+                key_frame=processor.key_frame,
+            )
+            return response
+        finally:
+            processor.release_key_frame()
 
     async def video_analyzer_pro(data_call):
         """Handle the service call to analyze a video with advanced options."""
@@ -843,43 +849,46 @@ def setup(hass, config):
             temperature=call.temperature,
         )
         processor = MediaProcessor(hass, request)
-        processor.jpeg_options = PRO_JPEG_OPTIONS
-        processor.ffmpeg_jpeg_q = PRO_FFMPEG_JPEG_Q
+        try:
+            processor.jpeg_options = PRO_JPEG_OPTIONS
+            processor.ffmpeg_jpeg_q = PRO_FFMPEG_JPEG_Q
 
-        # Omitted max_frames means "analyze all extracted frames" (unbounded)
-        max_frames = None if call.max_frames_raw is None else int(call.max_frames_raw)
+            # Omitted max_frames means "analyze all extracted frames" (unbounded)
+            max_frames = None if call.max_frames_raw is None else int(call.max_frames_raw)
 
-        request = await processor.add_videos(
-            video_paths=call.video_paths,
-            event_ids=call.event_id,
-            max_frames=max_frames,
-            target_width=call.target_width,
-            include_filename=call.include_filename,
-            expose_images=call.expose_images,
-            fps=call.fps,
-            polylines=call.polylines,
-            storage_path=call.storage_path,
-            debug_polylines=call.debug_polylines,
-        )
-        call.memory = Memory(hass)
-        await call.memory._update_memory()
+            request = await processor.add_videos(
+                video_paths=call.video_paths,
+                event_ids=call.event_id,
+                max_frames=max_frames,
+                target_width=call.target_width,
+                include_filename=call.include_filename,
+                expose_images=call.expose_images,
+                fps=call.fps,
+                polylines=call.polylines,
+                storage_path=call.storage_path,
+                debug_polylines=call.debug_polylines,
+            )
+            call.memory = Memory(hass)
+            await call.memory._update_memory()
 
-        response = await request.call(call)
-        # Add processor.key_frame to response if it exists
-        if processor.key_frame:
-            response["key_frame"] = processor.key_frame
-        # Add polyline debug information if collected
-        if processor.debug_info is not None:
-            response["debug"] = processor.debug_info
+            response = await request.call(call)
+            # Add processor.key_frame to response if it exists
+            if processor.key_frame:
+                response["key_frame"] = processor.key_frame
+            # Add polyline debug information if collected
+            if processor.debug_info is not None:
+                response["debug"] = processor.debug_info
 
-        await _create_event(
-            hass=hass,
-            call=call,  # type: ignore
-            start=start,
-            response=response,
-            key_frame=processor.key_frame,
-        )
-        return response
+            await _create_event(
+                hass=hass,
+                call=call,  # type: ignore
+                start=start,
+                response=response,
+                key_frame=processor.key_frame,
+            )
+            return response
+        finally:
+            processor.release_key_frame()
 
     async def stream_analyzer(data_call):
         """Handle the service call to analyze a stream"""
@@ -895,32 +904,34 @@ def setup(hass, config):
             temperature=call.temperature,
         )
         processor = MediaProcessor(hass, request)
+        try:
+            request = await processor.add_streams(
+                image_entities=call.image_entities,
+                duration=call.duration,
+                max_frames=call.max_frames,
+                target_width=call.target_width,
+                include_filename=call.include_filename,
+                expose_images=call.expose_images,
+            )
 
-        request = await processor.add_streams(
-            image_entities=call.image_entities,
-            duration=call.duration,
-            max_frames=call.max_frames,
-            target_width=call.target_width,
-            include_filename=call.include_filename,
-            expose_images=call.expose_images,
-        )
+            call.memory = Memory(hass)
+            await call.memory._update_memory()
 
-        call.memory = Memory(hass)
-        await call.memory._update_memory()
+            response = await request.call(call)
+            # Add processor.key_frame to response if it exists
+            if processor.key_frame:
+                response["key_frame"] = processor.key_frame
 
-        response = await request.call(call)
-        # Add processor.key_frame to response if it exists
-        if processor.key_frame:
-            response["key_frame"] = processor.key_frame
-
-        await _create_event(
-            hass=hass,
-            call=call,  # type: ignore
-            start=start,
-            response=response,
-            key_frame=processor.key_frame,
-        )
-        return response
+            await _create_event(
+                hass=hass,
+                call=call,  # type: ignore
+                start=start,
+                response=response,
+                key_frame=processor.key_frame,
+            )
+            return response
+        finally:
+            processor.release_key_frame()
 
     async def stream_analyzer_pro(data_call):
         """Handle the service call to analyze a stream with advanced options."""
@@ -936,137 +947,140 @@ def setup(hass, config):
             temperature=call.temperature,
         )
         processor = MediaProcessor(hass, request)
-        processor.jpeg_options = PRO_JPEG_OPTIONS
-        processor.ffmpeg_jpeg_q = PRO_FFMPEG_JPEG_Q
-
-        # Omitted max_frames means "analyze all captured frames" (unbounded)
-        max_frames = None if call.max_frames_raw is None else int(call.max_frames_raw)
-        image_entities = list(dict.fromkeys(call.image_entities or []))
-        if call.coalesce_while_recording:
-            if len(image_entities) != 1:
-                raise ServiceValidationError(
-                    "coalesce_while_recording requires exactly one camera entity"
-                )
-            if not call.motion_entities or any(
-                not isinstance(entity_id, str)
-                or not entity_id.startswith("binary_sensor.")
-                for entity_id in call.motion_entities
-            ):
-                raise ServiceValidationError(
-                    "coalesce_while_recording requires at least one binary_sensor "
-                    "motion_entity"
-                )
-
-        (
-            capture_locks,
-            capture_request_id,
-            waited_for_capture,
-            pending_request_id,
-        ) = await acquire_stream_capture_locks(
-            image_entities, call.coalesce_while_recording
-        )
-        if pending_request_id is not None:
-            return {
-                "capture": {
-                    "status": "coalesced",
-                    "reason": "pending_follow_up_exists",
-                    "request_id": capture_request_id,
-                    "follow_up_request_id": pending_request_id,
-                }
-            }
-
         try:
-            if waited_for_capture:
-                motion_states = [
-                    hass.states.get(entity_id) for entity_id in call.motion_entities
-                ]
-                if not any(
-                    state is not None and state.state == "on"
-                    for state in motion_states
-                ):
-                    reason = (
-                        "motion_state_unavailable"
-                        if any(
-                            state is None
-                            or state.state in ("unknown", "unavailable")
-                            for state in motion_states
-                        )
-                        else "motion_inactive"
+            processor.jpeg_options = PRO_JPEG_OPTIONS
+            processor.ffmpeg_jpeg_q = PRO_FFMPEG_JPEG_Q
+
+            # Omitted max_frames means "analyze all captured frames" (unbounded)
+            max_frames = None if call.max_frames_raw is None else int(call.max_frames_raw)
+            image_entities = list(dict.fromkeys(call.image_entities or []))
+            if call.coalesce_while_recording:
+                if len(image_entities) != 1:
+                    raise ServiceValidationError(
+                        "coalesce_while_recording requires exactly one camera entity"
                     )
-                    return {
-                        "capture": {
-                            "status": "skipped",
-                            "reason": reason,
-                            "request_id": capture_request_id,
-                        }
+                if not call.motion_entities or any(
+                    not isinstance(entity_id, str)
+                    or not entity_id.startswith("binary_sensor.")
+                    for entity_id in call.motion_entities
+                ):
+                    raise ServiceValidationError(
+                        "coalesce_while_recording requires at least one binary_sensor "
+                        "motion_entity"
+                    )
+
+            (
+                capture_locks,
+                capture_request_id,
+                waited_for_capture,
+                pending_request_id,
+            ) = await acquire_stream_capture_locks(
+                image_entities, call.coalesce_while_recording
+            )
+            if pending_request_id is not None:
+                return {
+                    "capture": {
+                        "status": "coalesced",
+                        "reason": "pending_follow_up_exists",
+                        "request_id": capture_request_id,
+                        "follow_up_request_id": pending_request_id,
                     }
+                }
 
-            request = await processor.add_streams(
-                image_entities=image_entities,
-                duration=call.duration,
-                max_frames=max_frames,
-                target_width=call.target_width,
-                include_filename=call.include_filename,
-                expose_images=call.expose_images,
-                fps=call.fps,
-                polylines=call.polylines,
-                storage_path=call.storage_path,
-                debug_polylines=call.debug_polylines,
-                clip_path=call.clip_path,
-                record_fps=call.record_fps,
-                record_scale=call.record_scale,
-                frame_source=call.frame_source,
-            )
-            clip_task = getattr(processor, "clip_task", None)
-            if asyncio.isfuture(clip_task):
-                await clip_task
-        except BaseException:
-            clip_task = getattr(processor, "clip_task", None)
-            if asyncio.isfuture(clip_task) and not clip_task.done():
-                clip_task.cancel()
-                try:
+            try:
+                if waited_for_capture:
+                    motion_states = [
+                        hass.states.get(entity_id) for entity_id in call.motion_entities
+                    ]
+                    if not any(
+                        state is not None and state.state == "on"
+                        for state in motion_states
+                    ):
+                        reason = (
+                            "motion_state_unavailable"
+                            if any(
+                                state is None
+                                or state.state in ("unknown", "unavailable")
+                                for state in motion_states
+                            )
+                            else "motion_inactive"
+                        )
+                        return {
+                            "capture": {
+                                "status": "skipped",
+                                "reason": reason,
+                                "request_id": capture_request_id,
+                            }
+                        }
+
+                request = await processor.add_streams(
+                    image_entities=image_entities,
+                    duration=call.duration,
+                    max_frames=max_frames,
+                    target_width=call.target_width,
+                    include_filename=call.include_filename,
+                    expose_images=call.expose_images,
+                    fps=call.fps,
+                    polylines=call.polylines,
+                    storage_path=call.storage_path,
+                    debug_polylines=call.debug_polylines,
+                    clip_path=call.clip_path,
+                    record_fps=call.record_fps,
+                    record_scale=call.record_scale,
+                    frame_source=call.frame_source,
+                )
+                clip_task = getattr(processor, "clip_task", None)
+                if asyncio.isfuture(clip_task):
                     await clip_task
-                except asyncio.CancelledError:
-                    pass
-            raise
-        finally:
-            release_stream_capture_locks(capture_locks)
+            except BaseException:
+                clip_task = getattr(processor, "clip_task", None)
+                if asyncio.isfuture(clip_task) and not clip_task.done():
+                    clip_task.cancel()
+                    try:
+                        await clip_task
+                    except asyncio.CancelledError:
+                        pass
+                raise
+            finally:
+                release_stream_capture_locks(capture_locks)
 
-        call.memory = Memory(hass)
-        await call.memory._update_memory()
+            call.memory = Memory(hass)
+            await call.memory._update_memory()
 
-        response = await request.call(call)
-        if call.coalesce_while_recording:
-            response["capture"] = {
-                "status": "completed",
-                "request_id": capture_request_id,
-            }
-        # Add processor.key_frame to response if it exists
-        if processor.key_frame:
-            response["key_frame"] = processor.key_frame
-        # Add polyline debug information if collected
-        if processor.debug_info is not None:
-            response["debug"] = processor.debug_info
-        # Return the requested path while background recording is still running.
-        requested_clip_paths = getattr(processor, "requested_clip_paths", [])
-        clip_paths = processor.clip_paths
-        if not clip_paths and isinstance(requested_clip_paths, list):
-            clip_paths = requested_clip_paths
-        if clip_paths:
-            response["clip"] = (
-                clip_paths[0]
-                if len(clip_paths) == 1
-                else clip_paths
+            response = await request.call(call)
+            if call.coalesce_while_recording:
+                response["capture"] = {
+                    "status": "completed",
+                    "request_id": capture_request_id,
+                }
+            # Add processor.key_frame to response if it exists
+            if processor.key_frame:
+                response["key_frame"] = processor.key_frame
+            # Add polyline debug information if collected
+            if processor.debug_info is not None:
+                response["debug"] = processor.debug_info
+            # Return the requested path while background recording is still running.
+            requested_clip_paths = getattr(processor, "requested_clip_paths", [])
+            clip_paths = processor.clip_paths
+            if not clip_paths and isinstance(requested_clip_paths, list):
+                clip_paths = requested_clip_paths
+            if clip_paths:
+                response["clip"] = (
+                    clip_paths[0]
+                    if len(clip_paths) == 1
+                    else clip_paths
+                )
+
+            await _create_event(
+                hass=hass,
+                call=call,  # type: ignore
+                start=start,
+                response=response,
+                key_frame=processor.key_frame,
             )
-
-        await _create_event(
-            hass=hass,
-            call=call,  # type: ignore
-            start=start,
-            response=response,
-            key_frame=processor.key_frame,
-        )
-        return response
+            return response
+        finally:
+            processor.release_key_frame()
 
     async def data_analyzer(data_call):
         """Handle the service call to analyze visual data"""
@@ -1122,34 +1136,37 @@ def setup(hass, config):
             temperature=call.temperature,
         )
         processor = MediaProcessor(hass, request)
-        request = await processor.add_visual_data(
-            image_entities=call.image_entities,
-            image_paths=call.image_paths,
-            target_width=call.target_width,
-            include_filename=call.include_filename,
-            expose_images=call.expose_images,
-        )
+        try:
+            request = await processor.add_visual_data(
+                image_entities=call.image_entities,
+                image_paths=call.image_paths,
+                target_width=call.target_width,
+                include_filename=call.include_filename,
+                expose_images=call.expose_images,
+            )
 
-        call.memory = Memory(hass, system_prompt=DATA_EXTRACTION_PROMPT)
-        await call.memory._update_memory()
+            call.memory = Memory(hass, system_prompt=DATA_EXTRACTION_PROMPT)
+            await call.memory._update_memory()
 
-        response = await request.call(call)
-        # Add processor.key_frame to response if it exists
-        if processor.key_frame:
-            response["key_frame"] = processor.key_frame
+            response = await request.call(call)
+            # Add processor.key_frame to response if it exists
+            if processor.key_frame:
+                response["key_frame"] = processor.key_frame
 
-        await _create_event(
-            hass=hass,
-            call=call,  # type: ignore
-            start=start,
-            response=response,
-            key_frame=processor.key_frame,
-        )
+            await _create_event(
+                hass=hass,
+                call=call,  # type: ignore
+                start=start,
+                response=response,
+                key_frame=processor.key_frame,
+            )
 
-        _LOGGER.debug(f"Response: {response}")
-        _LOGGER.debug(f"Sensor type: {type}")
-        await _update_sensor(hass, sensor_entity, response["response_text"], type)
-        return response
+            _LOGGER.debug(f"Response: {response}")
+            _LOGGER.debug(f"Sensor type: {type}")
+            await _update_sensor(hass, sensor_entity, response["response_text"], type)
+            return response
+        finally:
+            processor.release_key_frame()
 
     async def create_event(data_call) -> None:
         """Handle the service call to create an event"""

@@ -23,6 +23,7 @@ from homeassistant.helpers.network import get_url
 from homeassistant.exceptions import ServiceValidationError
 
 from .const import DOMAIN
+from .timeline import mark_key_frame_pending, release_key_frame
 from .stream_capture import (
     ALLOWED_CLIP_EXTENSIONS,
     ALLOWED_STREAM_SCHEMES,
@@ -118,6 +119,10 @@ class MediaProcessor:
             img = img.convert("RGB")
         return img
 
+    def release_key_frame(self):
+        """Allow timeline cleanup to manage the exposed key frame again."""
+        release_key_frame(self.hass, self.key_frame)
+
     async def _expose_image(self, frame_name, image_data, uid, frame_path=None):
         # ensure /media/llmvision/snapshots dir exists
         await self.hass.loop.run_in_executor(
@@ -127,6 +132,8 @@ class MediaProcessor:
         if self.key_frame == "":
             filename = f"/media/{DOMAIN}/snapshots/{uid}-{frame_name}.jpg"
             self.key_frame = filename
+            # Protect the snapshot from timeline cleanup while the request runs.
+            mark_key_frame_pending(self.hass, filename)
             if image_data is None and frame_path is not None:
                 # open image in hass.loop
                 with await self.hass.loop.run_in_executor(

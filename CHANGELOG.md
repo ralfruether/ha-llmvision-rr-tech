@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.7.2.14 - 2026-09-27
+
+### Fixed
+
+- Fixed exposed key frames being deleted by timeline snapshot cleanup while the
+  analyzer request was still running, which made notifications fail to attach
+  the returned `key_frame` (`No such file or directory`). All timeline instances
+  now share one pending-snapshot list and cleanup lock, and analyzers protect
+  their key frame from the moment it is written until the timeline event is
+  saved or the request fails.
+
 ## 1.7.2.13 - 2026-09-26
 
 ### Fixed

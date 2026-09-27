@@ -16,6 +16,37 @@ _LOGGER = logging.getLogger(__name__)
 
 DB_VERSION = 4
 
+# Every Timeline instance must see the same pending key frames and cleanup lock;
+# otherwise one instance's cleanup deletes another request's in-flight snapshot.
+_CLEANUP_STATE_KEY = f"{DOMAIN}_timeline_cleanup"
+
+
+def _shared_cleanup_state(hass: HomeAssistant) -> tuple[set[str], asyncio.Lock]:
+    """Return the pending key frame names and cleanup lock shared by all timelines."""
+    state = hass.data.get(_CLEANUP_STATE_KEY)
+    if state is None:
+        state = (set(), asyncio.Lock())
+        hass.data[_CLEANUP_STATE_KEY] = state
+    return state
+
+
+def _key_frame_name(key_frame: str | None) -> str:
+    return (os.path.basename(key_frame or "") or "").lower()
+
+
+def mark_key_frame_pending(hass: HomeAssistant, key_frame: str | None) -> None:
+    """Protect a snapshot from cleanup until release_key_frame is called."""
+    name = _key_frame_name(key_frame)
+    if name:
+        _shared_cleanup_state(hass)[0].add(name)
+
+
+def release_key_frame(hass: HomeAssistant, key_frame: str | None) -> None:
+    """Remove the cleanup protection added by mark_key_frame_pending."""
+    name = _key_frame_name(key_frame)
+    if name:
+        _shared_cleanup_state(hass)[0].discard(name)
+
 
 async def _get_category_and_label(
     hass: HomeAssistant, config_entry: ConfigEntry, query: str
@@ -207,8 +238,10 @@ class Timeline:
         self.retention_time = config_entry.data.get(CONF_RETENTION_TIME)
 
         # Track key_frame paths whose DB rows are not yet committed
-        self._pending_key_frames: set[str] = set()
-        self._cleanup_lock = asyncio.Lock()
+        (
+            self._pending_key_frames,
+            self._cleanup_lock,
+        ) = _shared_cleanup_state(hass)
         self._config_entry = config_entry
         self._migrating = True
 

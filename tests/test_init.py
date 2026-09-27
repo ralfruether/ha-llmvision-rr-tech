@@ -529,6 +529,10 @@ class TestSetupServices:
         processor.add_images = AsyncMock(return_value=request_obj)
         processor.add_videos = AsyncMock(return_value=request_obj)
         processor.add_streams = AsyncMock(return_value=request_obj)
+        released_before_event = []
+
+        async def record_event(**kwargs):
+            released_before_event.append(processor.release_key_frame.call_count)
 
         with (
             patch("custom_components.llmvision.ServiceCallData", return_value=call_obj),
@@ -536,7 +540,8 @@ class TestSetupServices:
             patch("custom_components.llmvision.MediaProcessor", return_value=processor),
             patch("custom_components.llmvision.Memory", return_value=memory_obj),
             patch(
-                "custom_components.llmvision._create_event", new=AsyncMock()
+                "custom_components.llmvision._create_event",
+                new=AsyncMock(side_effect=record_event),
             ) as create_event_mock,
         ):
             image_result = await handlers["image_analyzer"](
@@ -553,6 +558,39 @@ class TestSetupServices:
         assert video_result["key_frame"] == "frame.jpg"
         assert stream_result["key_frame"] == "frame.jpg"
         assert create_event_mock.await_count == 3
+        # Each handler releases its key frame only after its event is saved.
+        assert released_before_event == [0, 1, 2]
+        assert processor.release_key_frame.call_count == 3
+
+    @pytest.mark.anyio
+    async def test_analyzer_releases_key_frame_when_model_call_fails(self):
+        hass = _make_hass()
+        assert setup(hass, {}) is True
+        handlers = self._registered_handlers(hass)
+
+        call_obj = ServiceCallData(_build_data_call(_base_service_data(message="msg")))
+        request_obj = Mock()
+        request_obj.call = AsyncMock(side_effect=RuntimeError("provider failed"))
+        memory_obj = Mock()
+        memory_obj._update_memory = AsyncMock()
+        processor = Mock()
+        processor.key_frame = "/media/llmvision/snapshots/811e3db0-frame.jpg"
+        processor.add_images = AsyncMock(return_value=request_obj)
+
+        with (
+            patch("custom_components.llmvision.ServiceCallData", return_value=call_obj),
+            patch("custom_components.llmvision.Request", return_value=request_obj),
+            patch("custom_components.llmvision.MediaProcessor", return_value=processor),
+            patch("custom_components.llmvision.Memory", return_value=memory_obj),
+            patch(
+                "custom_components.llmvision._create_event", new=AsyncMock()
+            ) as create_event_mock,
+            pytest.raises(RuntimeError, match="provider failed"),
+        ):
+            await handlers["image_analyzer"](_build_data_call(_base_service_data()))
+
+        create_event_mock.assert_not_awaited()
+        processor.release_key_frame.assert_called_once_with()
 
     @pytest.mark.anyio
     async def test_data_analyzer_boolean_and_number_and_text_and_option(self):
