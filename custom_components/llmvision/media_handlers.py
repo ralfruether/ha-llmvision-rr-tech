@@ -17,11 +17,12 @@ from homeassistant.components.media_player.browse_media import (
 
 from urllib.parse import urlparse
 from functools import partial
-from PIL import Image, ImageDraw, UnidentifiedImageError
+from PIL import Image, ImageDraw, ImageFont, UnidentifiedImageError
 import numpy as np
 from homeassistant.helpers.network import get_url
 from homeassistant.exceptions import ServiceValidationError
 
+from . import face_client
 from .const import DOMAIN
 from .timeline import mark_key_frame_pending, release_key_frame
 from .stream_capture import (
@@ -63,6 +64,33 @@ async def _async_get_stream_source(hass, entity_id):
     return await async_get_stream_source(hass, entity_id)
 
 
+FACE_LABEL_COLOR = (0, 255, 0)
+
+
+def _label_font(size):
+    """Pillow's bundled default font at a readable size (bitmap font fallback)."""
+    try:
+        return ImageFont.load_default(size=size)
+    except (TypeError, OSError, AttributeError):
+        return ImageFont.load_default()
+
+
+def _draw_name_label(draw, rect, name, line_width, width, height, font):
+    """Draw a green head box and the name on a green tag above it."""
+    left, top, right, bottom = rect
+    draw.rectangle((left, top, right, bottom), outline=FACE_LABEL_COLOR, width=line_width)
+    text_left, text_top, text_right, text_bottom = draw.textbbox((0, 0), name, font=font)
+    pad = max(2, line_width)
+    tag_w = text_right - text_left + 2 * pad
+    tag_h = text_bottom - text_top + 2 * pad
+    x = max(0, min(left, width - tag_w))
+    y = top - tag_h
+    if y < 0:
+        y = min(max(0, height - tag_h), bottom + 1)
+    draw.rectangle((x, y, x + tag_w, y + tag_h), fill=FACE_LABEL_COLOR)
+    draw.text((x + pad - text_left, y + pad - text_top), name, fill=(0, 0, 0), font=font)
+
+
 class MediaProcessor:
     def __init__(self, hass, client):
         self.hass = hass
@@ -81,6 +109,23 @@ class MediaProcessor:
         # JPEG encoder options; the pro services opt into higher quality
         self.jpeg_options = {}
         self.ffmpeg_jpeg_q = 5
+        # Optional face identification, set by the pro service handlers
+        self.identify_persons = False
+        self.face_settings = None
+        self.face_results = []
+        self.face_labeled_names = set()
+        self._face_done = False
+        # Snapshot mode: clip bytes (or failure reason) read under the camera lock
+        self._face_clip_data = None
+        # Stream mode: frame label -> (camera entity, raw ffmpeg output index)
+        self._face_stream_frames = {}
+        # Camera entity -> requested clip path (None when no clip is recorded)
+        self._face_clip_plan = {}
+
+    @property
+    def face_active(self):
+        """True when identify_persons is requested and the service is configured."""
+        return bool(self.identify_persons and self.face_settings is not None)
 
     async def _encode_image(self, img):
         """Encode image as base64"""
@@ -814,6 +859,8 @@ class MediaProcessor:
         frames = {}
         previous_gray = None
         frame_index = 0
+        # Every JPEG ffmpeg emitted (incl. capped/undecodable): its time is raw/rate
+        raw_count = 0
         timed_out = False
         stop_now = False
         killed = False
@@ -841,7 +888,10 @@ class MediaProcessor:
                     break
                 if not chunk:
                     break
+                malformed_before = splitter.malformed
                 for jpeg_data in splitter.feed(chunk):
+                    raw_index = raw_count
+                    raw_count += 1
                     # Keep draining past the cap; ffmpeg's -frames:v bounds output too
                     if frame_index >= frame_cap:
                         continue
@@ -854,6 +904,7 @@ class MediaProcessor:
                     label = self._frame_label(
                         image_entity, camera_number, frame_index, include_filename
                     )
+                    self._face_stream_frames[label] = (image_entity, raw_index)
                     if first_frame is None:
                         first_frame = (label, jpeg_data)
                     else:
@@ -865,6 +916,8 @@ class MediaProcessor:
                         }
                     previous_gray = gray
                     frame_index += 1
+                # Oversized frames dropped by the splitter follow this chunk's frames
+                raw_count += splitter.malformed - malformed_before
                 if splitter.malformed >= MAX_MALFORMED_FRAMES:
                     _LOGGER.warning(
                         f"Stream for {image_entity} produced malformed frames; stopping"
@@ -937,6 +990,20 @@ class MediaProcessor:
         Returns a tuple of (base64_jpeg, (width, height), resolved_polylines)
         where resolved_polylines are the pixel coordinates actually drawn.
         """
+        base64_image, size, resolved, _ = await self._annotate_image(
+            image_data, target_width, polylines, None
+        )
+        return base64_image, size, resolved
+
+    async def _annotate_image(
+        self, image_data, target_width, polylines=None, face_labels=None
+    ):
+        """Resize an image to target_width, draw red polylines, then name labels.
+
+        face_labels is a list of (name, normalized face box); each is drawn as a
+        green head box with the name above it. Returns (base64_jpeg, (width,
+        height), resolved_polylines, resolved_faces) in pixel coordinates.
+        """
 
         def _work():
             img = Image.open(io.BytesIO(image_data))
@@ -951,19 +1018,29 @@ class MediaProcessor:
                 img = img.resize((target_width, target_height))
             w, h = img.size
             resolved = []
-            if polylines:
+            faces = []
+            if polylines or face_labels:
                 draw = ImageDraw.Draw(img)
                 line_width = max(2, round(min(w, h) * 0.005))
-                for polyline in polylines:
+                for polyline in polylines or []:
                     px_points = [
                         (round(x * w), round(y * h)) for (x, y) in polyline
                     ]
                     resolved.append(px_points)
                     draw.line(px_points, fill=(255, 0, 0), width=line_width)
+                font = (
+                    _label_font(max(12, round(min(w, h) * 0.03)))
+                    if face_labels
+                    else None
+                )
+                for name, box in face_labels or []:
+                    rect = face_client.head_box(box, w, h)
+                    _draw_name_label(draw, rect, name, line_width, w, h, font)
+                    faces.append({"name": name, "box": list(rect)})
             buffer = io.BytesIO()
             img.save(buffer, format="JPEG", **self.jpeg_options)
             base64_image = base64.b64encode(buffer.getvalue()).decode("utf-8")
-            return base64_image, (w, h), resolved
+            return base64_image, (w, h), resolved, faces
 
         return await self.hass.loop.run_in_executor(None, _work)
 
@@ -988,6 +1065,142 @@ class MediaProcessor:
                 f"Failed to write snapshot to {path}: {err}"
             )
         return path
+
+    async def _storage_copy(
+        self, model_b64, frame_data, target_width, polylines, face_labels
+    ):
+        """Image for storage_path: the model frame, but never with name labels."""
+        if not face_labels:
+            return model_b64
+        if polylines:
+            clean, _, _, _ = await self._annotate_image(
+                frame_data, target_width, polylines, None
+            )
+            return clean
+        return await self.resize_image(target_width=target_width, image_data=frame_data)
+
+    def _start_face_task(self, clip_data, camera):
+        """Upload an already-read clip in the background; returns the task."""
+        return asyncio.ensure_future(
+            face_client.async_identify(
+                self.hass, self.face_settings, camera, clip_data=clip_data
+            )
+        )
+
+    async def _prepare_face_task(self, clip_path, camera):
+        """Read the clip now (before it may be deleted) and start the upload.
+
+        Returns a future that resolves to a FaceResult and never raises except on
+        cancellation.
+        """
+        try:
+            clip_data = await face_client.async_load_clip(self.hass, clip_path)
+        except face_client.FaceServiceError as err:
+            future = asyncio.get_running_loop().create_future()
+            future.set_result(face_client.error_result(camera, err.reason))
+            return future
+        return self._start_face_task(clip_data, camera)
+
+    async def _identify_camera_clips(self, entities, clip_paths, preloaded=None):
+        """One identification call per camera clip; returns {entity: FaceResult}.
+
+        preloaded maps entity -> clip bytes, or a failure reason when reading failed.
+        """
+        written = set(self.clip_paths or [])
+        preloaded = preloaded or {}
+
+        async def _one(entity):
+            camera = face_client.camera_slug_for_entity(entity)
+            if entity in preloaded:
+                item = preloaded[entity]
+                if isinstance(item, str):
+                    return entity, face_client.error_result(camera, item)
+                return entity, await face_client.async_identify(
+                    self.hass, self.face_settings, camera, clip_data=item
+                )
+            path = clip_paths.get(entity)
+            if not path or path not in written:
+                return entity, face_client.error_result(
+                    camera, face_client.REASON_NO_CLIP
+                )
+            return entity, await face_client.async_identify(
+                self.hass, self.face_settings, camera, clip_path=path
+            )
+
+        results = dict(await asyncio.gather(*(_one(entity) for entity in entities)))
+        self.face_results.extend(results[entity] for entity in entities)
+        return results
+
+    async def _identify_stream_clips(
+        self, image_entities, clip_plans, rate, selected_frames
+    ):
+        """Stream mode: identify persons per camera clip and map them to frames.
+
+        A frame's clip time is its raw ffmpeg output index divided by the stream
+        frame rate. Returns {selected frame index: [(name, box), ...]}.
+        """
+        self._face_done = True
+        if not self.face_active:
+            return {}
+        entities = list(dict.fromkeys(image_entities))
+        clip_paths = {
+            entity: plan[0] for entity, plan in (clip_plans or {}).items() if plan
+        }
+        results = await self._identify_camera_clips(entities, clip_paths)
+        labels = {}
+        if not rate:
+            return labels
+        for idx, (frame_name, _, _) in enumerate(selected_frames):
+            info = self._face_stream_frames.get(frame_name)
+            if info is None:
+                continue
+            entity, raw_index = info
+            result = results.get(entity)
+            if result is None or not result.ok:
+                continue
+            frame_labels = face_client.labels_for_time(
+                result.persons, raw_index / rate
+            )
+            if frame_labels:
+                labels[idx] = frame_labels
+        return labels
+
+    async def load_recorded_clips(self):
+        """Snapshot mode: read the recorded clips while the camera lock is held.
+
+        A follow-up capture may overwrite the same clip_path as soon as the lock is
+        released, so the bytes are kept in memory until identify_recorded_clips.
+        """
+        if self._face_done or not self.face_active:
+            return
+        written = set(self.clip_paths or [])
+        loaded = {}
+        for entity, path in self._face_clip_plan.items():
+            if not path or path not in written:
+                continue
+            try:
+                loaded[entity] = await face_client.async_load_clip(self.hass, path)
+            except face_client.FaceServiceError as err:
+                loaded[entity] = err.reason
+        self._face_clip_data = loaded
+
+    async def identify_recorded_clips(self):
+        """Snapshot mode: identify persons in the recorded clips (facts only).
+
+        Called by stream_analyzer_pro after the capture locks are released. Does
+        nothing when identification already ran during stream capture.
+        """
+        if self._face_done or not self.face_active:
+            return
+        self._face_done = True
+        entities = list(self._face_clip_plan)
+        preloaded, self._face_clip_data = self._face_clip_data, None
+        if not entities:
+            self.face_results.append(
+                face_client.error_result("camera", face_client.REASON_NO_CLIP)
+            )
+            return
+        await self._identify_camera_clips(entities, self._face_clip_plan, preloaded)
 
     async def record(
         self,
@@ -1236,27 +1449,38 @@ class MediaProcessor:
                 reference_bytes, candidate_bytes
             )
 
+            # Stream clips: identify persons once the clips are complete
+            frame_labels = {}
+            if self.identify_persons and frame_source == FRAME_SOURCE_STREAM:
+                frame_labels = await self._identify_stream_clips(
+                    image_entities, clip_plans, rate, selected_frames
+                )
+
             debug_info = [] if debug_polylines else None
             # Add annotated frames to the model and analyzed-snapshot storage.
             resized_base64 = []
             for idx, (frame_name, frame_data, _) in enumerate(selected_frames):
-                if polylines:
-                    resized_image, (fw, fh), resolved = (
-                        await self._draw_polylines_on_image(
+                labels = frame_labels.get(idx)
+                if polylines or labels:
+                    resized_image, (fw, fh), resolved, faces = (
+                        await self._annotate_image(
                             image_data=frame_data,
                             target_width=target_width,
                             polylines=polylines,
+                            face_labels=labels,
                         )
                     )
+                    self.face_labeled_names.update(face["name"] for face in faces)
                     if debug_info is not None:
-                        debug_info.append(
-                            {
-                                "frame": frame_name,
-                                "width": fw,
-                                "height": fh,
-                                "polylines": resolved,
-                            }
-                        )
+                        entry = {
+                            "frame": frame_name,
+                            "width": fw,
+                            "height": fh,
+                            "polylines": resolved,
+                        }
+                        if self.identify_persons:
+                            entry["faces"] = faces
+                        debug_info.append(entry)
                 else:
                     resized_image = await self.resize_image(
                         target_width=target_width, image_data=frame_data
@@ -1266,18 +1490,24 @@ class MediaProcessor:
 
             if resolved_storage or debug_polylines:
                 stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-                for idx, (frame_name, _, _) in enumerate(selected_frames):
+                for idx, (frame_name, frame_data, _) in enumerate(selected_frames):
                     safe_name = frame_name.replace("/", "_").replace("..", "_")
                     filename = f"{safe_name}-{stamp}-{idx}.jpg"
                     if resolved_storage:
                         await self._write_snapshot(
                             directory=resolved_storage,
                             filename=filename,
-                            image_data=resized_base64[idx],
+                            image_data=await self._storage_copy(
+                                resized_base64[idx],
+                                frame_data,
+                                target_width,
+                                polylines,
+                                frame_labels.get(idx),
+                            ),
                         )
                     # In debug mode also persist annotated frames for inspection,
                     # even when expose_images is off.
-                    if debug_polylines and polylines:
+                    if debug_polylines and (polylines or frame_labels.get(idx)):
                         await self._write_snapshot(
                             directory=self.snapshots_path,
                             filename=f"debug-{filename}",
@@ -1290,7 +1520,7 @@ class MediaProcessor:
             if expose_images:
                 key_name = selected_frames[key_idx][0]
                 key_b64 = resized_base64[key_idx]
-                if polylines:
+                if polylines or frame_labels.get(key_idx):
                     key_b64 = await self.resize_image(
                         target_width=target_width,
                         image_data=selected_frames[key_idx][1],
@@ -1415,9 +1645,12 @@ class MediaProcessor:
         resolved_storage=None,
         debug_polylines=False,
     ):
+        face_task = None
         try:
             current_event_id = str(uuid.uuid4())
             video_path = video_path.strip()
+            face_camera = face_client.camera_slug_for_video(video_path)
+            sample_fps = None
 
             # Resolve media source (media-source://...)
             if is_media_source_id(video_path):
@@ -1449,6 +1682,7 @@ class MediaProcessor:
                     fps_value = 0
                 if fps_value > 0:
                     frame_filter = f"fps={fps_value}"
+                    sample_fps = fps_value
             ffmpeg_tail = [
                 "-vf",  # video filter
                 frame_filter,
@@ -1478,6 +1712,10 @@ class MediaProcessor:
                 ):
                     raise ServiceValidationError(
                         f"Failed to fetch video from {video_path}"
+                    )
+                if self.face_active:
+                    face_task = await self._prepare_face_task(
+                        temp_file_path, face_camera
                     )
 
                 ffmpeg_cmd = [
@@ -1514,6 +1752,8 @@ class MediaProcessor:
 
             else:
                 # Local file
+                if self.face_active:
+                    face_task = await self._prepare_face_task(video_path, face_camera)
                 ffmpeg_cmd = [
                     "ffmpeg",
                     "-hide_banner",
@@ -1553,6 +1793,9 @@ class MediaProcessor:
             frame_counter = 0
             jpeg_buffer = b""
             first_frame = None
+            # Raw ffmpeg output index (incl. undecodable frames) per decoded frame
+            raw_count = 0
+            raw_by_counter = {}
 
             def find_jpeg_frames(data):
                 frames = []
@@ -1591,14 +1834,17 @@ class MediaProcessor:
 
                     jpeg_buffer += chunk
                     found_frames, jpeg_buffer = find_jpeg_frames(jpeg_buffer)
+                    raw_base = raw_count
+                    raw_count += len(found_frames)
 
-                    for jpeg_data in found_frames:
+                    for raw_index, jpeg_data in enumerate(found_frames, raw_base):
                         try:
                             img = Image.open(io.BytesIO(jpeg_data))
                             await self.hass.loop.run_in_executor(None, img.load)
                             if img.mode == "RGBA":
                                 img = img.convert("RGB")
                             current_frame_gray = np.array(img.convert("L"))
+                            raw_by_counter[frame_counter] = raw_index
                             if previous_frame is not None:
                                 score = self._similarity_score(
                                     previous_frame, current_frame_gray
@@ -1703,27 +1949,49 @@ class MediaProcessor:
 
             video_base = os.path.splitext(os.path.basename(video_path))[0]
 
-            # Every frame sent to the model carries the polylines.
+            # Face identification ran alongside ffmpeg; frame n of the fps output
+            # is at n / fps seconds. I-frame mode has no frame times: facts only.
+            frame_labels = {}
+            if face_task is not None:
+                face_result = await face_task
+                face_task = None
+                self.face_results.append(face_result)
+                if face_result.ok and sample_fps:
+                    for i, (_, _, counter) in enumerate(selected_frames):
+                        raw_index = raw_by_counter.get(counter)
+                        if raw_index is None:
+                            continue
+                        labels = face_client.labels_for_time(
+                            face_result.persons, raw_index / sample_fps
+                        )
+                        if labels:
+                            frame_labels[i] = labels
+
+            # Every frame sent to the model carries the polylines and name labels.
             resized_base64 = []
             for i, (frame_data, _, _) in enumerate(selected_frames):
                 idx = i + 1
-                if polylines:
-                    resized_image, (fw, fh), resolved = (
-                        await self._draw_polylines_on_image(
+                labels = frame_labels.get(i)
+                if polylines or labels:
+                    resized_image, (fw, fh), resolved, faces = (
+                        await self._annotate_image(
                             image_data=frame_data,
                             target_width=target_width,
                             polylines=polylines,
+                            face_labels=labels,
                         )
                     )
+                    self.face_labeled_names.update(face["name"] for face in faces)
                     if debug_polylines and self.debug_info is not None:
-                        self.debug_info.append(
-                            {
-                                "frame": f"{video_base} frame {idx}",
-                                "width": fw,
-                                "height": fh,
-                                "polylines": resolved,
-                            }
-                        )
+                        entry = {
+                            "frame": f"{video_base} frame {idx}",
+                            "width": fw,
+                            "height": fh,
+                            "polylines": resolved,
+                        }
+                        if self.identify_persons:
+                            entry["faces"] = faces
+                        self.debug_info.append(entry)
                 else:
                     resized_image = await self.resize_image(
                         target_width=target_width, image_data=frame_data
@@ -1748,9 +2016,15 @@ class MediaProcessor:
                         await self._write_snapshot(
                             directory=resolved_storage,
                             filename=filename,
-                            image_data=resized_base64[i],
+                            image_data=await self._storage_copy(
+                                resized_base64[i],
+                                selected_frames[i][0],
+                                target_width,
+                                polylines,
+                                frame_labels.get(i),
+                            ),
                         )
-                    if debug_polylines and polylines:
+                    if debug_polylines and (polylines or frame_labels.get(i)):
                         await self._write_snapshot(
                             directory=self.snapshots_path,
                             filename=f"debug-{filename}",
@@ -1760,7 +2034,7 @@ class MediaProcessor:
             if expose_images and selected_frames and key_idx is not None:
                 frame_idx_label = (selected_frames[key_idx][2] or 0) + 1
                 key_b64 = resized_base64[key_idx]
-                if polylines:
+                if polylines or frame_labels.get(key_idx):
                     # Expose a clean copy; the model's copy stays annotated.
                     key_b64 = await self.resize_image(
                         target_width=target_width,
@@ -1773,6 +2047,9 @@ class MediaProcessor:
                 )
         except Exception as e:
             raise ServiceValidationError(f"Error processing video {video_path}: {e}")
+        finally:
+            if face_task is not None and not face_task.done():
+                face_task.cancel()
 
     async def add_videos(
         self,
@@ -1875,6 +2152,7 @@ class MediaProcessor:
                         "frames per camera; reduce duration or fps"
                     )
             clip_plans = None
+            self._face_clip_plan = {entity: None for entity in image_entities}
             if resolved_clip is not None:
                 # Default to a 1080p cap unless the caller sets record_scale (0 = native)
                 scale_width = 1920 if record_scale is None else int(record_scale)
@@ -1887,6 +2165,7 @@ class MediaProcessor:
                     )
                     for camera_entity in entities
                 ]
+                self._face_clip_plan = dict(zip(entities, self.requested_clip_paths))
                 if frame_source == FRAME_SOURCE_STREAM:
                     # The frame-capturing ffmpeg process also writes the clip
                     clip_plans = {

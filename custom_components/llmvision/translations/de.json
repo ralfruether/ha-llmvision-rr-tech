@@ -414,6 +414,18 @@
                             "memory_paths": "Gib einen oder mehrere Pfade zu Bildern an, die gespeichert werden sollen.",
                             "memory_strings": "Gib die Beschreibungen der Bilder an, die gespeichert werden sollen. Diese müssen in der gleichen Reihenfolge wie die Bildpfade angegeben werden."
                         }
+                    },
+                    "face_service_section": {
+                        "name": "Gesichtserkennung (optional)",
+                        "description": "Sendet aufgezeichnete Clips optional an einen lokalen Gesichtserkennungsdienst, damit video_analyzer_pro und stream_analyzer_pro bekannte Haushaltsmitglieder benennen können (Service-Option identify_persons). Dies ist eine biometrische Identifikation: erkannte Namen werden an deinen KI-Anbieter gesendet. Verwende Identitäten niemals, um Schlösser, Alarme oder andere Sicherheitsaktionen auszulösen.",
+                        "data": {
+                            "face_service_url": "URL des Gesichtserkennungsdienstes",
+                            "face_service_token": "Token des Gesichtserkennungsdienstes"
+                        },
+                        "data_description": {
+                            "face_service_url": "Basis-URL des Dienstes, z. B. http://192.168.1.10:8770. Unverschlüsseltes http ist nur für private IP-Adressen und .local/.lan-Hosts erlaubt. Leer lassen zum Deaktivieren.",
+                            "face_service_token": "Bearer-Token des Dienstes (16-512 Zeichen). Erforderlich, wenn eine URL gesetzt ist."
+                        }
                     }
                 }
             }
@@ -424,7 +436,9 @@
             "invalid_provider": "Ungültiger Anbieter ausgewählt",
             "memory_not_supported": "Dieser Anbieter unterstützt keine Erinnerungen.",
             "invalid_image_path": "Ein oder mehrere Bildpfade sind ungültig.",
-            "mismatched_lengths": "Die Anzahl der Bildpfade und Beschreibungen muss übereinstimmen."
+            "mismatched_lengths": "Die Anzahl der Bildpfade und Beschreibungen muss übereinstimmen.",
+            "invalid_face_service_url": "Ungültige URL des Gesichtserkennungsdienstes. Verwende http(s)://host[:port] ohne Zugangsdaten, Query oder Fragment; unverschlüsseltes http nur für private IP-Adressen oder .local/.lan-Hosts.",
+            "invalid_face_service_token": "Ungültiges Token des Gesichtserkennungsdienstes. Es ist erforderlich, wenn eine URL gesetzt ist, und muss 16-512 Zeichen lang sein (Buchstaben, Ziffern und ._~+/=-)."
         },
         "abort": {
             "unknown_provider": "Unbekannter Anbieter",

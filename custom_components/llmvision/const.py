@@ -50,6 +50,9 @@ CONF_TITLE_PROMPT = "title_prompt"
 CONF_MEMORY_PATHS = "memory_paths"
 CONF_MEMORY_IMAGES_ENCODED = "memory_images_encoded"
 CONF_MEMORY_STRINGS = "memory_strings"
+# Optional local face identification service (Settings entry)
+CONF_FACE_SERVICE_URL = "face_service_url"
+CONF_FACE_SERVICE_TOKEN = "face_service_token"
 
 # Dispatcher signals
 SIGNAL_TIMELINE_UPDATED = f"{DOMAIN}_timeline_updated"
@@ -94,6 +97,7 @@ RECORD_SCALE = "record_scale"
 FRAME_SOURCE = "frame_source"
 COALESCE_WHILE_RECORDING = "coalesce_while_recording"
 MOTION_ENTITY = "motion_entity"
+IDENTIFY_PERSONS = "identify_persons"
 
 # Error messages
 ERROR_NOT_CONFIGURED = "{provider} is not configured"

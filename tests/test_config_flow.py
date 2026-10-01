@@ -18,6 +18,8 @@ from custom_components.llmvision.const import (
     CONF_CONTEXT_WINDOW,
     CONF_CUSTOM_OPENAI_ENDPOINT,
     CONF_DEFAULT_MODEL,
+    CONF_FACE_SERVICE_TOKEN,
+    CONF_FACE_SERVICE_URL,
     CONF_FALLBACK_PROVIDER,
     CONF_HTTPS,
     CONF_IP_ADDRESS,
@@ -333,6 +335,153 @@ class TestSettingsStep:
 
         assert result["type"] == "form"
         assert result["step_id"] == "settings"
+
+
+FACE_TOKEN = "face-service-token-0123456789"
+
+
+def _settings_input(face_section=None):
+    user_input = {
+        "general_section": {
+            CONF_FALLBACK_PROVIDER: "no_fallback",
+            CONF_REQUEST_TIMEOUT: 60,
+        },
+        "prompt_section": {CONF_SYSTEM_PROMPT: "system", CONF_TITLE_PROMPT: "title"},
+        "timeline_section": {
+            CONF_TIMELINE_LANGUAGE: "English",
+            CONF_RETENTION_TIME: 7,
+        },
+    }
+    if face_section is not None:
+        user_input["face_service_section"] = face_section
+    return user_input
+
+
+class TestFaceServiceSettings:
+    """Optional face service URL/token on the Settings entry."""
+
+    @pytest.mark.asyncio
+    async def test_saves_normalized_url_and_token(self, build_flow):
+        flow = build_flow(init_info={CONF_PROVIDER: "Settings"})
+        result = await flow.async_step_settings(
+            _settings_input(
+                {
+                    CONF_FACE_SERVICE_URL: " http://192.168.9.230:8770/ ",
+                    CONF_FACE_SERVICE_TOKEN: FACE_TOKEN,
+                }
+            )
+        )
+        assert result["type"] == "create_entry"
+        assert result["data"][CONF_FACE_SERVICE_URL] == "http://192.168.9.230:8770"
+        assert result["data"][CONF_FACE_SERVICE_TOKEN] == FACE_TOKEN
+
+    @pytest.mark.asyncio
+    async def test_defaults_to_disabled(self, build_flow):
+        flow = build_flow(init_info={CONF_PROVIDER: "Settings"})
+        result = await flow.async_step_settings(_settings_input())
+        assert result["data"][CONF_FACE_SERVICE_URL] == ""
+        assert result["data"][CONF_FACE_SERVICE_TOKEN] == ""
+
+    @pytest.mark.asyncio
+    async def test_reconfigure_clears_fields(self, build_flow):
+        existing = Mock(
+            data={
+                CONF_PROVIDER: "Settings",
+                CONF_FACE_SERVICE_URL: "http://192.168.9.230:8770",
+                CONF_FACE_SERVICE_TOKEN: FACE_TOKEN,
+            }
+        )
+        flow = build_flow(source=config_entries.SOURCE_RECONFIGURE)
+        flow._get_reconfigure_entry = Mock(return_value=existing)
+        # The frontend omits cleared optional fields
+        result = await flow.async_step_settings(_settings_input({}))
+        assert result["type"] == "update"
+        assert result["data_updates"][CONF_FACE_SERVICE_URL] == ""
+        assert result["data_updates"][CONF_FACE_SERVICE_TOKEN] == ""
+
+    @pytest.mark.asyncio
+    async def test_reconfigure_suggests_existing_values(self, build_flow):
+        existing = Mock(
+            data={
+                CONF_PROVIDER: "Settings",
+                CONF_FACE_SERVICE_URL: "http://192.168.9.230:8770",
+                CONF_FACE_SERVICE_TOKEN: FACE_TOKEN,
+            }
+        )
+        flow = build_flow(source=config_entries.SOURCE_RECONFIGURE)
+        flow._get_reconfigure_entry = Mock(return_value=existing)
+        await flow.async_step_settings()
+        suggested = flow.add_suggested_values_to_schema.call_args.args[1]
+        assert suggested["face_service_section"] == {
+            CONF_FACE_SERVICE_URL: "http://192.168.9.230:8770",
+            CONF_FACE_SERVICE_TOKEN: FACE_TOKEN,
+        }
+        schema_keys = [str(key) for key in flow.async_show_form.call_args.kwargs[
+            "data_schema"
+        ].schema]
+        assert schema_keys[-1] == "face_service_section"
+
+    @pytest.mark.asyncio
+    async def test_old_entry_without_keys_shows_empty_fields(self, build_flow):
+        existing = Mock(data={CONF_PROVIDER: "Settings", CONF_RETENTION_TIME: 7})
+        flow = build_flow(source=config_entries.SOURCE_RECONFIGURE)
+        flow._get_reconfigure_entry = Mock(return_value=existing)
+        result = await flow.async_step_settings()
+        assert result["type"] == "form"
+        suggested = flow.add_suggested_values_to_schema.call_args.args[1]
+        assert suggested["face_service_section"] == {
+            CONF_FACE_SERVICE_URL: "",
+            CONF_FACE_SERVICE_TOKEN: "",
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://8.8.8.8:8770",
+            "http://face.example.com",
+            "ftp://192.168.9.230",
+            "http://user:pw@192.168.9.230:8770",
+            "http://192.168.9.230:8770/?a=1",
+            "http://192.168.9.230:8770#x",
+            "not a url",
+        ],
+    )
+    async def test_rejects_invalid_url(self, build_flow, url):
+        flow = build_flow(init_info={CONF_PROVIDER: "Settings"})
+        result = await flow.async_step_settings(
+            _settings_input(
+                {CONF_FACE_SERVICE_URL: url, CONF_FACE_SERVICE_TOKEN: FACE_TOKEN}
+            )
+        )
+        assert result["type"] == "form"
+        assert result["errors"] == {"base": "invalid_face_service_url"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("token", [None, "", "short", "has space in the token value"])
+    async def test_rejects_missing_or_invalid_token(self, build_flow, token):
+        flow = build_flow(init_info={CONF_PROVIDER: "Settings"})
+        section = {CONF_FACE_SERVICE_URL: "https://face.example.com"}
+        if token is not None:
+            section[CONF_FACE_SERVICE_TOKEN] = token
+        result = await flow.async_step_settings(_settings_input(section))
+        assert result["type"] == "form"
+        assert result["errors"] == {"base": "invalid_face_service_token"}
+
+    def test_translations_cover_section_and_errors(self):
+        import json
+        import pathlib
+
+        base = pathlib.Path("custom_components/llmvision")
+        for name in ("strings.json", "translations/en.json", "translations/de.json"):
+            data = json.loads((base / name).read_text(encoding="utf-8"))
+            sections = data["config"]["step"]["settings"]["sections"]
+            assert set(sections["face_service_section"]["data"]) == {
+                CONF_FACE_SERVICE_URL,
+                CONF_FACE_SERVICE_TOKEN,
+            }
+            assert "invalid_face_service_url" in data["config"]["error"]
+            assert "invalid_face_service_token" in data["config"]["error"]
 
 
 class TestProviderSteps:

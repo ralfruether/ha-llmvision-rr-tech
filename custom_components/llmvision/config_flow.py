@@ -68,7 +68,10 @@ from .const import (
     CONF_REASONING_EFFORT,
     CONF_KEEP_ALIVE,
     VERSION_AZURE,
+    CONF_FACE_SERVICE_URL,
+    CONF_FACE_SERVICE_TOKEN,
 )
+from .face_client import is_valid_face_service_token, normalize_face_service_url
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -1469,6 +1472,19 @@ class llmvisionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     ),
                     {"collapsed": True},
                 ),
+                vol.Optional("face_service_section"): section(
+                    vol.Schema(
+                        {
+                            vol.Optional(CONF_FACE_SERVICE_URL): selector(
+                                {"text": {"type": "url"}}
+                            ),
+                            vol.Optional(CONF_FACE_SERVICE_TOKEN): selector(
+                                {"text": {"type": "password"}}
+                            ),
+                        }
+                    ),
+                    {"collapsed": True},
+                ),
             }
         )
 
@@ -1512,6 +1528,12 @@ class llmvisionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     CONF_RESIZE_MEMORY_IMAGES, True
                 ),
             },
+            "face_service_section": {
+                CONF_FACE_SERVICE_URL: self.init_info.get(CONF_FACE_SERVICE_URL, ""),
+                CONF_FACE_SERVICE_TOKEN: self.init_info.get(
+                    CONF_FACE_SERVICE_TOKEN, ""
+                ),
+            },
         }
         data_schema = self.add_suggested_values_to_schema(data_schema, suggested)
 
@@ -1536,6 +1558,23 @@ class llmvisionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             for path in user_input.get(CONF_MEMORY_PATHS, []):
                 if not os.path.exists(path):
                     errors = {"base": "invalid_image_path"}
+
+            # Missing keys mean "cleared" so reconfigure can disable the service
+            user_input.setdefault(CONF_FACE_SERVICE_URL, "")
+            user_input.setdefault(CONF_FACE_SERVICE_TOKEN, "")
+            try:
+                user_input[CONF_FACE_SERVICE_URL] = normalize_face_service_url(
+                    user_input[CONF_FACE_SERVICE_URL]
+                )
+            except ValueError:
+                errors = {"base": "invalid_face_service_url"}
+            else:
+                token = str(user_input[CONF_FACE_SERVICE_TOKEN] or "").strip()
+                user_input[CONF_FACE_SERVICE_TOKEN] = token
+                if user_input[CONF_FACE_SERVICE_URL] and not is_valid_face_service_token(
+                    token
+                ):
+                    errors = {"base": "invalid_face_service_token"}
 
             if errors:
                 return self.async_show_form(

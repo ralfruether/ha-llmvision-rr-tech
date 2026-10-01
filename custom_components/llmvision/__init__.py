@@ -5,6 +5,7 @@ from .timeline import Timeline
 from .providers import Request
 from .memory import Memory
 from .media_handlers import MediaProcessor
+from . import face_client
 from .stream_capture import PRO_FFMPEG_JPEG_Q, PRO_JPEG_OPTIONS
 import os, re
 from datetime import timedelta
@@ -72,6 +73,7 @@ from .const import (
     FRAME_SOURCE,
     COALESCE_WHILE_RECORDING,
     MOTION_ENTITY,
+    IDENTIFY_PERSONS,
     DATA_EXTRACTION_PROMPT,
     DEFAULT_OPENAI_MODEL,
     DEFAULT_ANTHROPIC_MODEL,
@@ -516,6 +518,9 @@ class ServiceCallData:
         self.motion_entities = (
             [motion_entities] if isinstance(motion_entities, str) else motion_entities or []
         )
+        self.identify_persons: bool = (
+            data_call.data.get(IDENTIFY_PERSONS, False) is True
+        )
         self.structure: dict | None = data_call.data.get(STRUCTURE, None)
         self.title_field: str = data_call.data.get(TITLE_FIELD, "")
         self.description_field: str = data_call.data.get(DESCRIPTION_FIELD, "")
@@ -701,6 +706,37 @@ async def _update_sensor(hass, sensor_entity: str, value: str | int, type: str) 
         raise
 
 
+def _face_requested(call) -> bool:
+    return getattr(call, "identify_persons", False) is True
+
+
+def _setup_face_identification(hass, processor, call) -> None:
+    """Enable optional face identification on the processor for this call."""
+    if _face_requested(call):
+        processor.identify_persons = True
+        processor.face_settings = face_client.get_face_settings(hass)
+
+
+def _append_face_facts(call, processor) -> None:
+    """Append the identified persons as one paragraph of the user prompt."""
+    if not _face_requested(call):
+        return
+    fact = face_client.build_fact_text(
+        processor.face_results, processor.face_labeled_names
+    )
+    if fact:
+        call.message = f"{call.message}\n\n{fact}"
+
+
+def _add_face_response(call, processor, response: dict) -> None:
+    if _face_requested(call):
+        response.update(
+            face_client.service_response_fields(
+                processor.face_settings is not None, processor.face_results
+            )
+        )
+
+
 def setup(hass, config):
     stream_capture_locks = {}
     pending_stream_captures = {}
@@ -852,6 +888,7 @@ def setup(hass, config):
         try:
             processor.jpeg_options = PRO_JPEG_OPTIONS
             processor.ffmpeg_jpeg_q = PRO_FFMPEG_JPEG_Q
+            _setup_face_identification(hass, processor, call)
 
             # Omitted max_frames means "analyze all extracted frames" (unbounded)
             max_frames = None if call.max_frames_raw is None else int(call.max_frames_raw)
@@ -868,6 +905,7 @@ def setup(hass, config):
                 storage_path=call.storage_path,
                 debug_polylines=call.debug_polylines,
             )
+            _append_face_facts(call, processor)
             call.memory = Memory(hass)
             await call.memory._update_memory()
 
@@ -878,6 +916,7 @@ def setup(hass, config):
             # Add polyline debug information if collected
             if processor.debug_info is not None:
                 response["debug"] = processor.debug_info
+            _add_face_response(call, processor, response)
 
             await _create_event(
                 hass=hass,
@@ -950,6 +989,7 @@ def setup(hass, config):
         try:
             processor.jpeg_options = PRO_JPEG_OPTIONS
             processor.ffmpeg_jpeg_q = PRO_FFMPEG_JPEG_Q
+            _setup_face_identification(hass, processor, call)
 
             # Omitted max_frames means "analyze all captured frames" (unbounded)
             max_frames = None if call.max_frames_raw is None else int(call.max_frames_raw)
@@ -1032,6 +1072,10 @@ def setup(hass, config):
                 clip_task = getattr(processor, "clip_task", None)
                 if asyncio.isfuture(clip_task):
                     await clip_task
+                if _face_requested(call):
+                    # Read snapshot-mode clips before a follow-up capture can
+                    # overwrite them; the upload happens after the lock release.
+                    await processor.load_recorded_clips()
             except BaseException:
                 clip_task = getattr(processor, "clip_task", None)
                 if asyncio.isfuture(clip_task) and not clip_task.done():
@@ -1044,6 +1088,10 @@ def setup(hass, config):
             finally:
                 release_stream_capture_locks(capture_locks)
 
+            if _face_requested(call):
+                # Snapshot clips are identified outside the camera locks
+                await processor.identify_recorded_clips()
+            _append_face_facts(call, processor)
             call.memory = Memory(hass)
             await call.memory._update_memory()
 
@@ -1059,6 +1107,7 @@ def setup(hass, config):
             # Add polyline debug information if collected
             if processor.debug_info is not None:
                 response["debug"] = processor.debug_info
+            _add_face_response(call, processor, response)
             # Return the requested path while background recording is still running.
             requested_clip_paths = getattr(processor, "requested_clip_paths", [])
             clip_paths = processor.clip_paths

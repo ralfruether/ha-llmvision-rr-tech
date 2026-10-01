@@ -398,6 +398,14 @@ video_analyzer_pro:
       default: false
       selector:
         boolean:
+    identify_persons:
+      name: Identify Persons
+      required: false
+      description: 'Send the clip to the local face service configured in the LLM Vision Settings and mark recognized household members with a green box and their name on the analyzed frames (the exposed key frame stays clean). Names are added to the prompt and sent to the AI provider. The response gains persons, face_service and face_service_ms. Requires a clip: video files, or clip_path for streams. Identities are not liveness-checked and must not drive locks, alarms or other security actions.'
+      example: false
+      default: false
+      selector:
+        boolean:
     include_filename:
       name: Include Filename
       required: true
@@ -757,6 +765,14 @@ stream_analyzer_pro:
       name: Debug Polylines
       required: false
       description: 'Add a debug section to the response with the resolved pixel coordinates of the drawn polylines and persist the annotated frames for inspection.'
+      example: false
+      default: false
+      selector:
+        boolean:
+    identify_persons:
+      name: Identify Persons
+      required: false
+      description: 'Send the clip to the local face service configured in the LLM Vision Settings and mark recognized household members with a green box and their name on the analyzed frames (the exposed key frame stays clean). Names are added to the prompt and sent to the AI provider. The response gains persons, face_service and face_service_ms. Requires a clip: video files, or clip_path for streams. Identities are not liveness-checked and must not drive locks, alarms or other security actions.'
       example: false
       default: false
       selector:
