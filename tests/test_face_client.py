@@ -212,15 +212,16 @@ class TestLabelsAndBoxes:
         )
 
     def test_nearest_sample_within_window(self):
-        person = self._person(0.4, 1.4, 3.0)
-        assert face_client.nearest_sample(person.samples, 1.0).t == 1.4
-        assert face_client.nearest_sample(person.samples, 2.5).t == 3.0
-        assert face_client.nearest_sample(person.samples, 3.5).t == 3.0
+        person = self._person(0.4, 1.2, 3.0)
+        assert face_client.nearest_sample(person.samples, 1.0).t == 1.2
+        assert face_client.nearest_sample(person.samples, 2.8).t == 3.0
+        assert face_client.nearest_sample(person.samples, 3.25).t == 3.0
 
     def test_no_sample_outside_window(self):
         person = self._person(0.0, 3.0)
         assert face_client.nearest_sample(person.samples, 1.5) is None
-        assert face_client.nearest_sample(person.samples, 3.51) is None
+        assert face_client.nearest_sample(person.samples, 3.26) is None
+        assert face_client.nearest_sample(person.samples, 0.5) is None  # one slot away
         assert face_client.labels_for_time([person], 1.5) == []
 
     def test_labels_for_time(self):
@@ -704,3 +705,11 @@ class TestClipLoading:
         hass = _hass()
         assert await face_client.async_load_clip(hass, str(clip)) == MP4
         hass.loop.run_in_executor.assert_awaited_once()
+
+
+def test_fps_frame_time_matches_ffmpeg_fps_filter():
+    # ffmpeg's fps filter keeps the last input frame of each output slot, so output
+    # frame n shows the scene at about (n + 0.5) / rate (measured +0.47 s at fps=1).
+    assert face_client.fps_frame_time(0, 1.0) == 0.5
+    assert face_client.fps_frame_time(6, 1.0) == 6.5
+    assert face_client.fps_frame_time(3, 2.0) == 1.75

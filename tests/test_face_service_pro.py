@@ -35,7 +35,7 @@ def _green_pixels(b64):
     return sum(1 for r, g, b in img.getdata() if g > 150 and r < 100 and b < 100)
 
 
-def _ok_result(t=2.0, camera="haustuer", has_unknown=False):
+def _ok_result(t=2.5, camera="haustuer", has_unknown=False):
     return FaceResult(
         camera=camera,
         status="ok",
@@ -236,14 +236,14 @@ class TestStreamMode:
         self, processor, tmp_path
     ):
         _enable(processor)
-        identify = AsyncMock(return_value=_ok_result(t=2.0))
+        identify = AsyncMock(return_value=_ok_result(t=2.5))
         with patch.object(face_client, "async_identify", identify):
             clip = await self._record(processor, tmp_path)
 
         identify.assert_awaited_once()
         assert identify.await_args.args[2] == "haustuer"
         assert identify.await_args.kwargs == {"clip_path": clip}
-        # raw indices 0, 2, 3 at 1 fps -> t = 0, 2, 3; the sample at t=2 labels frame 1
+        # raw indices 0, 2, 3 at 1 fps show t = 0.5, 2.5, 3.5; the sample at 2.5 labels frame 1
         assert [_green_pixels(img) > 20 for img in _model_images(processor)] == [
             False, True, False,
         ]
@@ -405,7 +405,7 @@ class TestVideoMode:
         proc = FakeProcess(FakeStream([data]))
         processor._select_keyframe_index = AsyncMock(return_value=1)
         processor.debug_info = []
-        identify = identify or AsyncMock(return_value=_ok_result(t=2.0))
+        identify = identify or AsyncMock(return_value=_ok_result(t=2.5))
         with (
             patch.object(face_client, "async_identify", identify),
             patch(
@@ -434,7 +434,7 @@ class TestVideoMode:
         identify.assert_awaited_once()
         assert identify.await_args.args[2] == "haustuer"
         assert identify.await_args.kwargs == {"clip_data": MP4 + b"data"}
-        # fps output n = 0, (1 undecodable), 2, 3 -> t = n / fps
+        # fps output n = 0, (1 undecodable), 2, 3 shows t = (n + 0.5) / fps
         assert [_green_pixels(img) > 20 for img in _model_images(processor)] == [
             False, True, False,
         ]
@@ -447,8 +447,9 @@ class TestVideoMode:
     @pytest.mark.asyncio
     async def test_fractional_fps(self, processor, tmp_path):
         _enable(processor)
-        # 2 fps: raw 0, 2, 3 -> t = 0, 1.0, 1.5; a sample at 1.6 labels raw 3 only
-        identify = AsyncMock(return_value=_ok_result(t=1.6))
+        # 2 fps: raw 0, 2, 3 -> frames show t = 0.25, 1.25, 1.75 (ffmpeg fps filter keeps
+        # the last frame of each slot); a sample at 1.9 labels raw 3 only
+        identify = AsyncMock(return_value=_ok_result(t=1.9))
         await self._add_video(processor, self._clip(tmp_path), fps=2, identify=identify)
         assert [_green_pixels(img) > 20 for img in _model_images(processor)] == [
             False, False, True,

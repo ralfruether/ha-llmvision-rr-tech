@@ -63,8 +63,10 @@ data:
   so a follow-up capture to the same `clip_path` cannot replace it before upload.
   The request has a total timeout of 12 seconds, follows no redirects and accepts
   at most 256 KiB of JSON.
-- A label uses the face sample closest to the frame time within ±0.5 s; the box is
-  the detected face enlarged about 1.6× to cover the head.
+- A label uses the face sample closest to the time the frame actually shows within
+  ±0.25 s; the box is the detected face enlarged about 1.6× to cover the head. ffmpeg's
+  `fps=` filter keeps the last frame of each slot, so frame n shows the scene at about
+  (n + 0.5) / fps; labels are placed for that time (measured on real recordings).
 - Only names matching `^[a-z][a-z .'-]{0,39}$` are used; invalid names, scores and
   boxes are dropped. Service identifiers and model versions never reach the prompt.
 

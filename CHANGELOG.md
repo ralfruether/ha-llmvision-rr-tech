@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Fixed face-service name labels being drawn about half a second behind the person
+  on `stream_analyzer_pro` and `video_analyzer_pro` frames. ffmpeg's `fps` filter
+  keeps the last frame of each output slot, so frame n shows the scene at about
+  (n + 0.5) / fps, not n / fps (measured +0.47 s at fps 1 on real recordings).
+  Labels now use that time and only face samples within ±0.25 s, so a label is
+  no longer borrowed from a moment the person has already moved on.
+
 ## 1.7.2.15 - 2026-10-02
 
 ### Added

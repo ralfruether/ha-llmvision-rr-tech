@@ -39,7 +39,9 @@ MAX_RESPONSE_BYTES = 256 * 1024
 MAX_PERSONS = 10
 MAX_SAMPLES = 500
 MAX_SAMPLE_TIME = 3600.0
-LABEL_TIME_WINDOW = 0.5
+# The face service samples 3 faces per second, so a visible face always has a sample
+# within ~0.17 s; a wider window borrows positions from moments the person has moved on.
+LABEL_TIME_WINDOW = 0.25
 HEAD_BOX_SCALE = 1.6
 SCORE_DECIMALS = 3
 
@@ -441,6 +443,17 @@ def nearest_sample(
         if delta <= window and (best_delta is None or delta < best_delta):
             best, best_delta = sample, delta
     return best
+
+
+def fps_frame_time(index: int, rate: float) -> float:
+    """Clip time shown by output frame `index` of an ffmpeg `fps=rate` filter.
+
+    The filter rounds input timestamps to the nearest output slot and keeps the last
+    input frame of each slot, so output frame n shows the scene at about
+    (n + 0.5) / rate (minus one source frame), not n / rate. Measured on real
+    recordings at fps=1: +0.47 s, which put name labels half a second behind.
+    """
+    return (index + 0.5) / rate
 
 
 def labels_for_time(persons, t: float) -> list[tuple[str, tuple]]:

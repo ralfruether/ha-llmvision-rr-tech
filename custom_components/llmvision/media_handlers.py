@@ -1159,7 +1159,7 @@ class MediaProcessor:
             if result is None or not result.ok:
                 continue
             frame_labels = face_client.labels_for_time(
-                result.persons, raw_index / rate
+                result.persons, face_client.fps_frame_time(raw_index, rate)
             )
             if frame_labels:
                 labels[idx] = frame_labels
@@ -1962,7 +1962,8 @@ class MediaProcessor:
                         if raw_index is None:
                             continue
                         labels = face_client.labels_for_time(
-                            face_result.persons, raw_index / sample_fps
+                            face_result.persons,
+                            face_client.fps_frame_time(raw_index, sample_fps),
                         )
                         if labels:
                             frame_labels[i] = labels
