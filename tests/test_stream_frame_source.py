@@ -586,6 +586,29 @@ class TestCaptureStreamCamera:
         assert str(clip) in args and "libx264" in args and args.count("-i") == 1
 
     @pytest.mark.asyncio
+    async def test_copy_clip_finalized_before_it_is_reported(self, processor, tmp_path):
+        clip = tmp_path / "clips" / "a.mp4"
+        processor.clip_codec = "copy"
+        seen = []
+
+        async def _finalize(path):
+            seen.append((path, list(processor.clip_paths)))
+
+        processor._finalize_copied_clip = _finalize
+        proc = FakeProcess(
+            FakeStream([_jpeg("red")]), on_exit=lambda: clip.write_bytes(b"mp4")
+        )
+        result, exec_mock = await self._capture(
+            processor, proc, clip_plan=(str(clip), None, 0)
+        )
+        assert result is not None
+        assert seen == [(str(clip), [])]
+        assert processor.clip_paths == [str(clip)]
+        args = exec_mock.await_args.args
+        assert args[args.index("-c:v") + 1] == "copy" and "libx264" not in args
+        assert "mjpeg" in args and args.count("-i") == 1
+
+    @pytest.mark.asyncio
     async def test_cancellation_kills_process(self, processor, tmp_path):
         clip = tmp_path / "a.mp4"
         clip.write_bytes(b"partial")
@@ -715,13 +738,21 @@ class TestProHandlers:
         assert call.frame_source == "stream"
         assert ServiceCallData(_build_data_call({})).frame_source is None
 
+    def test_service_call_data_reads_record_codec(self):
+        call = ServiceCallData(_build_data_call({"record_codec": "copy"}))
+        assert call.record_codec == "copy"
+        assert ServiceCallData(_build_data_call({})).record_codec is None
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "service,method", [("stream_analyzer_pro", "add_streams"), ("video_analyzer_pro", "add_videos")]
     )
     async def test_pro_handlers_enable_high_quality(self, service, method):
         handlers = _handlers()
-        data = {"provider": "e", "message": "m", "frame_source": "stream"}
+        data = {
+            "provider": "e", "message": "m", "frame_source": "stream",
+            "record_codec": "copy",
+        }
         call_obj = ServiceCallData(_build_data_call(data))
         request_obj = Mock()
         request_obj.call = AsyncMock(return_value={"response_text": "ok"})
@@ -747,6 +778,7 @@ class TestProHandlers:
         assert processor.ffmpeg_jpeg_q == PRO_FFMPEG_JPEG_Q
         if method == "add_streams":
             assert processor.add_streams.await_args.kwargs["frame_source"] == "stream"
+            assert processor.add_streams.await_args.kwargs["record_codec"] == "copy"
 
 
 class TestVideoQuality:

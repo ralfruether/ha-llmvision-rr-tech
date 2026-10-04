@@ -33,15 +33,21 @@ from .stream_capture import (
     MAX_MALFORMED_FRAMES,
     MAX_STREAM_FRAMES,
     PROCESS_STOP_TIMEOUT,
+    RECORD_CODEC_COPY,
+    RECORD_CODEC_H264,
+    REMUX_TIMEOUT,
     STDERR_TAIL_BYTES,
     STREAM_GRACE,
     STREAM_READ_CHUNK,
     STREAM_STALL_TIMEOUT,
     STREAM_STARTUP_TIMEOUT,
     JpegStreamSplitter,
+    build_hvc1_remux_cmd,
     build_stream_capture_cmd,
     coerce_number,
+    mp4_video_sample_entry,
     normalize_frame_source,
+    normalize_record_codec,
     redact,
     redacted_command,
     stream_frame_cap,
@@ -51,6 +57,13 @@ from .stream_capture import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _remove_quietly(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 async def _async_get_stream_source(hass, entity_id):
@@ -106,6 +119,8 @@ class MediaProcessor:
         self.clip_paths = []
         self.requested_clip_paths = []
         self.clip_task = None
+        # record_codec of the call: h264 transcode or copy of the original stream
+        self.clip_codec = RECORD_CODEC_H264
         # JPEG encoder options; the pro services opt into higher quality
         self.jpeg_options = {}
         self.ffmpeg_jpeg_q = 5
@@ -532,14 +547,33 @@ class MediaProcessor:
         return f"{stem}-{safe}{ext}"
 
     @staticmethod
-    def _clip_output_args(duration, record_fps, out_path, scale_width=1920):
+    def _clip_output_args(
+        duration, record_fps, out_path, scale_width=1920, record_codec=None
+    ):
         """ffmpeg output options that transcode a stream to a phone-friendly mp4.
 
         Downscales oversized streams (never upscales), lets libx264 pick the
         correct H.264 level for the resolution, and uses a short keyframe
         interval so playback decodes smoothly. Frame timing is preserved
         (native) unless a record_fps is given to force a constant rate.
+        With record_codec "copy" the original video stream is stored unchanged.
         """
+        if record_codec == RECORD_CODEC_COPY:
+            return [
+                "-t",
+                str(duration),
+                "-an",
+                "-sn",
+                "-dn",
+                "-c:v",
+                "copy",
+                "-movflags",
+                "+faststart",
+                "-avoid_negative_ts",
+                "make_zero",
+                "-y",
+                out_path,
+            ]
         # Values end up in an ffmpeg filter graph: accept plain numbers only
         record_fps = coerce_number(record_fps, "record_fps", 1, 60)
         scale_width = coerce_number(
@@ -584,7 +618,13 @@ class MediaProcessor:
 
     @classmethod
     def _build_clip_ffmpeg_cmd(
-        cls, stream_url, duration, record_fps, out_path, scale_width=1920
+        cls,
+        stream_url,
+        duration,
+        record_fps,
+        out_path,
+        scale_width=1920,
+        record_codec=None,
     ):
         """Build the ffmpeg command to transcode a stream to a phone-friendly mp4."""
         return [
@@ -596,7 +636,9 @@ class MediaProcessor:
             *stream_input_args(stream_url),
             "-i",
             stream_url,
-            *cls._clip_output_args(duration, record_fps, out_path, scale_width),
+            *cls._clip_output_args(
+                duration, record_fps, out_path, scale_width, record_codec
+            ),
         ]
 
     async def record_clip(
@@ -634,7 +676,12 @@ class MediaProcessor:
                 partial(os.makedirs, os.path.dirname(out_path), exist_ok=True),
             )
             cmd = self._build_clip_ffmpeg_cmd(
-                stream_url, duration, record_fps, out_path, scale_width
+                stream_url,
+                duration,
+                record_fps,
+                out_path,
+                scale_width,
+                self.clip_codec,
             )
             _LOGGER.debug(f"Recording clip: {redacted_command(cmd, stream_url)}")
             proc = None
@@ -654,6 +701,7 @@ class MediaProcessor:
                     _LOGGER.error(f"Clip recording for {camera_entity} timed out")
                     continue
                 if proc.returncode == 0 and os.path.exists(out_path):
+                    await self._finalize_copied_clip(out_path)
                     written.append(out_path)
                 else:
                     detail = (
@@ -678,6 +726,77 @@ class MediaProcessor:
 
         self.clip_paths = written
         return written
+
+    async def _finalize_copied_clip(self, clip_path):
+        """Make a stream-copied H.265 clip playable on Apple devices (hev1 -> hvc1).
+
+        Only the container is rewritten, into a temporary file next to the clip that
+        atomically replaces it. On any failure the original copy is kept (the face
+        service decodes hev1 as well) and a warning is logged.
+        """
+        if self.clip_codec != RECORD_CODEC_COPY:
+            return
+        loop = self.hass.loop
+        try:
+            entry = await loop.run_in_executor(None, mp4_video_sample_entry, clip_path)
+        except OSError as err:
+            _LOGGER.warning(f"Could not inspect clip {clip_path}: {err}")
+            return
+        if entry != "hev1":
+            return
+        root, ext = os.path.splitext(clip_path)
+        tmp_path = f"{root}.hvc1-{uuid.uuid4().hex[:12]}{ext}"
+        replaced = False
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *build_hvc1_remux_cmd(clip_path, tmp_path),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                _, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=REMUX_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                _LOGGER.warning(f"Retagging clip {clip_path} as hvc1 timed out")
+                return
+            if proc.returncode != 0:
+                detail = (
+                    stderr[-STDERR_TAIL_BYTES:].decode(errors="ignore")
+                    if stderr
+                    else "unknown error"
+                )
+                _LOGGER.warning(
+                    f"Retagging clip {clip_path} as hvc1 failed: "
+                    f"{redact(detail)[-1000:]}"
+                )
+                return
+            if (
+                await loop.run_in_executor(None, mp4_video_sample_entry, tmp_path)
+            ) != "hvc1":
+                _LOGGER.warning(f"Retagging clip {clip_path} as hvc1 had no effect")
+                return
+            await loop.run_in_executor(None, os.replace, tmp_path, clip_path)
+            replaced = True
+        except Exception as err:
+            _LOGGER.warning(
+                f"Retagging clip {clip_path} as hvc1 failed: {redact(err)}"
+            )
+        finally:
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                await proc.wait()
+            if not replaced:
+                try:
+                    await loop.run_in_executor(None, _remove_quietly, tmp_path)
+                except asyncio.CancelledError:
+                    # Cancelled while cleaning up: still never leave the temp file
+                    _remove_quietly(tmp_path)
+                    raise
 
     @staticmethod
     def _frame_label(image_entity, camera_number, frame_index, include_filename):
@@ -817,7 +936,7 @@ class MediaProcessor:
                 partial(os.makedirs, os.path.dirname(clip_path), exist_ok=True),
             )
             clip_args = self._clip_output_args(
-                duration, record_fps, clip_path, scale_width
+                duration, record_fps, clip_path, scale_width, self.clip_codec
             )
 
         cmd = build_stream_capture_cmd(
@@ -978,6 +1097,7 @@ class MediaProcessor:
             except OSError:
                 size = 0
             if size > 0:
+                await self._finalize_copied_clip(clip_path)
                 self.clip_paths.append(clip_path)
 
         if first_frame is None:
@@ -2123,8 +2243,10 @@ class MediaProcessor:
         record_fps=None,
         record_scale=None,
         frame_source=None,
+        record_codec=None,
     ):
         frame_source = normalize_frame_source(frame_source)
+        self.clip_codec = normalize_record_codec(record_codec)
         if image_entities:
             # Resolve/confine the clip path before recording so a bad path fails
             # fast without cancelling the snapshot capture.
@@ -2137,6 +2259,14 @@ class MediaProcessor:
                 record_scale = coerce_number(
                     record_scale, "record_scale", 0, 7680, integer=True
                 )
+                if self.clip_codec == RECORD_CODEC_COPY and (
+                    record_fps is not None or record_scale
+                ):
+                    raise ServiceValidationError(
+                        "record_fps and record_scale cannot be used with "
+                        "record_codec 'copy' (the original stream is stored "
+                        "unchanged); leave them empty"
+                    )
             if frame_source == FRAME_SOURCE_STREAM:
                 duration = coerce_number(
                     duration, "duration", 1, 600, allow_none=False
@@ -2157,6 +2287,8 @@ class MediaProcessor:
             if resolved_clip is not None:
                 # Default to a 1080p cap unless the caller sets record_scale (0 = native)
                 scale_width = 1920 if record_scale is None else int(record_scale)
+                if self.clip_codec == RECORD_CODEC_COPY:
+                    scale_width = 0
                 entities = list(image_entities)
                 self.requested_clip_paths = [
                     (

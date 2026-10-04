@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Added `record_codec` to `stream_analyzer_pro`. `h264` (default) keeps the current
+  phone-friendly H.264 transcode. `copy` stores the original camera stream without
+  re-encoding: native resolution, compressed only once, little CPU on the Home
+  Assistant host. The local face service then gets the same full-resolution input it
+  was evaluated on. Stream-copied H.265 clips are retagged from `hev1` to `hvc1` (container
+  only) so iPhones play them. `record_fps` and `record_scale` (other than 0) are
+  rejected with `copy`. Face labels keep their timing: the copied clip and the
+  analyzed frames come from the same ffmpeg session and start at the same keyframe.
+
+### Changed
+
+- `record_scale` no longer pre-fills 1920 in the service UI (an empty value still means
+  1920 for `h264`), so ticking the field does not break `record_codec: copy`.
+
 ## 1.7.2.16 - 2026-10-02
 
 ### Fixed

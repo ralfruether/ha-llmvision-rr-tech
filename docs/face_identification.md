@@ -63,6 +63,13 @@ data:
   so a follow-up capture to the same `clip_path` cannot replace it before upload.
   The request has a total timeout of 12 seconds, follows no redirects and accepts
   at most 256 KiB of JSON.
+- `stream_analyzer_pro` transcodes the clip to H.264 capped at 1920 px by default.
+  With `record_codec: copy` the face service receives the original camera stream
+  (native resolution, compressed only once, e.g. H.265), which matches the
+  conditions the face service was evaluated on. Native clips are larger; keep
+  `duration` short enough to stay under the 64 MB limit. Face labels keep their
+  timing: the copied clip and the analyzed frames come from the same ffmpeg session
+  and both start at the stream's first keyframe.
 - A label uses the face sample closest to the time the frame actually shows within
   ±0.25 s; the box is the detected face enlarged about 1.6× to cover the head. ffmpeg's
   `fps=` filter keeps the last frame of each slot, so frame n shows the scene at about

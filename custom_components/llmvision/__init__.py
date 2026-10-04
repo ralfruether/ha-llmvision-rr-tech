@@ -70,6 +70,7 @@ from .const import (
     CLIP_PATH,
     RECORD_FPS,
     RECORD_SCALE,
+    RECORD_CODEC,
     FRAME_SOURCE,
     COALESCE_WHILE_RECORDING,
     MOTION_ENTITY,
@@ -510,6 +511,7 @@ class ServiceCallData:
         self.clip_path: str = data_call.data.get(CLIP_PATH, "")
         self.record_fps = data_call.data.get(RECORD_FPS)
         self.record_scale = data_call.data.get(RECORD_SCALE)
+        self.record_codec = data_call.data.get(RECORD_CODEC)
         self.frame_source = data_call.data.get(FRAME_SOURCE)
         self.coalesce_while_recording: bool = data_call.data.get(
             COALESCE_WHILE_RECORDING, False
@@ -1068,6 +1070,7 @@ def setup(hass, config):
                     record_fps=call.record_fps,
                     record_scale=call.record_scale,
                     frame_source=call.frame_source,
+                    record_codec=call.record_codec,
                 )
                 clip_task = getattr(processor, "clip_task", None)
                 if asyncio.isfuture(clip_task):

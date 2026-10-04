@@ -6,6 +6,7 @@ Pure functions and small classes so they can be unit tested without Home Assista
 from __future__ import annotations
 
 import math
+import os
 import re
 from urllib.parse import unquote, urlsplit
 
@@ -20,8 +21,17 @@ FRAME_SOURCE_SNAPSHOT = "snapshot"
 FRAME_SOURCE_STREAM = "stream"
 FRAME_SOURCES = (FRAME_SOURCE_SNAPSHOT, FRAME_SOURCE_STREAM)
 
+RECORD_CODEC_H264 = "h264"
+RECORD_CODEC_COPY = "copy"
+RECORD_CODECS = (RECORD_CODEC_H264, RECORD_CODEC_COPY)
+
 ALLOWED_STREAM_SCHEMES = ("rtsp", "rtsps", "rtmp", "rtmps", "http", "https")
 ALLOWED_CLIP_EXTENSIONS = (".mp4", ".m4v", ".mov")
+
+# Bounds for reading the MP4 index of a recorded clip
+MAX_MP4_MOOV_BYTES = 32 * 1024 * 1024
+MAX_MP4_TOP_LEVEL_BOXES = 64
+REMUX_TIMEOUT = 60.0
 
 # Resource bounds for untrusted stream data
 MAX_STREAM_FRAMES = 300
@@ -87,6 +97,131 @@ def normalize_frame_source(value) -> str:
     if normalized not in FRAME_SOURCES:
         raise ServiceValidationError("frame_source must be 'snapshot' or 'stream'")
     return normalized
+
+
+def normalize_record_codec(value) -> str:
+    """Validate the record_codec service field (default: h264 transcode)."""
+    if value is None:
+        return RECORD_CODEC_H264
+    normalized = str(value).strip().lower()
+    if not normalized:
+        return RECORD_CODEC_H264
+    if normalized not in RECORD_CODECS:
+        raise ServiceValidationError("record_codec must be 'h264' or 'copy'")
+    return normalized
+
+
+def _iter_boxes(data, start, end):
+    """Yield (type, payload_start, box_end) for the ISO-BMFF boxes in data[start:end]."""
+    pos = start
+    while pos + 8 <= end:
+        size = int.from_bytes(data[pos : pos + 4], "big")
+        kind = bytes(data[pos + 4 : pos + 8])
+        header = 8
+        if size == 1:
+            if pos + 16 > end:
+                return
+            size = int.from_bytes(data[pos + 8 : pos + 16], "big")
+            header = 16
+        elif size == 0:
+            size = end - pos
+        if size < header or pos + size > end:
+            return
+        yield kind, pos + header, pos + size
+        pos += size
+
+
+def _child(data, start, end, kind):
+    for child, payload, box_end in _iter_boxes(data, start, end):
+        if child == kind:
+            return payload, box_end
+    return None
+
+
+def _video_sample_entry(moov) -> str | None:
+    for kind, start, end in _iter_boxes(moov, 0, len(moov)):
+        if kind != b"trak":
+            continue
+        mdia = _child(moov, start, end, b"mdia")
+        if mdia is None:
+            continue
+        hdlr = _child(moov, *mdia, b"hdlr")
+        # hdlr: version/flags (4), pre_defined (4), handler_type (4)
+        if hdlr is None or moov[hdlr[0] + 8 : hdlr[0] + 12] != b"vide":
+            continue
+        box = mdia
+        for name in (b"minf", b"stbl", b"stsd"):
+            box = _child(moov, *box, name)
+            if box is None:
+                break
+        if box is None:
+            continue
+        # stsd: version/flags (4), entry_count (4), then the first sample entry box
+        entry = moov[box[0] + 12 : box[0] + 16]
+        if len(entry) == 4 and entry.isalnum():
+            return entry.decode("ascii")
+    return None
+
+
+def mp4_video_sample_entry(path) -> str | None:
+    """Sample entry type of the first video track ('hvc1', 'hev1', 'avc1', ...).
+
+    Reads only the top-level box headers and the bounded moov box (blocking I/O; call
+    from an executor). Returns None when the file is not a readable MP4/MOV.
+    """
+    with open(path, "rb") as fh:
+        file_size = os.fstat(fh.fileno()).st_size
+        pos = 0
+        for _ in range(MAX_MP4_TOP_LEVEL_BOXES):
+            if pos + 8 > file_size:
+                return None
+            fh.seek(pos)
+            head = fh.read(16)
+            size = int.from_bytes(head[:4], "big")
+            kind = head[4:8]
+            header = 8
+            if size == 1:
+                if len(head) < 16:
+                    return None
+                size = int.from_bytes(head[8:16], "big")
+                header = 16
+            elif size == 0:
+                size = file_size - pos
+            if size < header:
+                return None
+            if kind == b"moov":
+                if size - header > MAX_MP4_MOOV_BYTES:
+                    return None
+                fh.seek(pos + header)
+                return _video_sample_entry(fh.read(size - header))
+            pos += size
+    return None
+
+
+def build_hvc1_remux_cmd(src_path, dst_path) -> list[str]:
+    """ffmpeg command that rewrites only the container: H.265 sample entry hev1 -> hvc1.
+
+    Apple players reject hev1, which is ffmpeg's default tag for H.265 in MP4.
+    """
+    return [
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        src_path,
+        "-map",
+        "0:v:0",
+        "-c",
+        "copy",
+        "-tag:v",
+        "hvc1",
+        "-movflags",
+        "+faststart",
+        "-y",
+        dst_path,
+    ]
 
 
 def coerce_number(value, name, minimum, maximum, integer=False, allow_none=True):

@@ -780,7 +780,7 @@ stream_analyzer_pro:
     clip_path:
       name: Clip Path
       required: false
-      description: 'Full path (including filename) for a recorded video clip of the live stream, transcoded to a fluent H.264 mp4 (.mp4, .m4v or .mov). With frame_source snapshot the clip is recorded independently of the analyzed snapshots; with frame_source stream it is written by the same ffmpeg session that decodes the frames. Relative paths are stored under /media/llmvision/. Absolute paths must resolve inside the Home Assistant media or config directory. With multiple cameras, the camera name is inserted before the extension.'
+      description: 'Full path (including filename) for a recorded video clip of the live stream (.mp4, .m4v or .mov). By default the stream is transcoded to a fluent H.264 mp4; with record_codec copy the original camera stream is stored unchanged. With frame_source snapshot the clip is recorded independently of the analyzed snapshots; with frame_source stream it is written by the same ffmpeg session that decodes the frames. Relative paths are stored under /media/llmvision/. Absolute paths must resolve inside the Home Assistant media or config directory. With multiple cameras, the camera name is inserted before the extension.'
       example: '/media/llmvision/clips/front_door.mp4'
       selector:
         text:
@@ -798,7 +798,7 @@ stream_analyzer_pro:
     record_fps:
       name: Recording FPS
       required: false
-      description: 'Force a constant frame rate for the recorded clip (independent of the analysis fps). Leave empty to keep the camera''s native frame timing (recommended).'
+      description: 'Force a constant frame rate for the recorded clip (independent of the analysis fps). Leave empty to keep the camera''s native frame timing (recommended). Must be empty with record_codec copy.'
       example: 15
       selector:
         number:
@@ -809,15 +809,25 @@ stream_analyzer_pro:
     record_scale:
       name: Recording Width
       required: false
-      description: 'Downscale the recorded clip to this width (keeps aspect ratio, never upscales). Improves phone playback and file size. Defaults to 1920 (1080p). Set to 0 to keep the camera''s native resolution.'
+      description: 'Downscale the recorded clip to this width (keeps aspect ratio, never upscales). Improves phone playback and file size. Empty means 1920 (1080p). Set to 0 to keep the camera''s native resolution. Must be empty or 0 with record_codec copy.'
       example: 1920
-      default: 1920
       selector:
         number:
           min: 0
           max: 3840
           step: 2
           mode: box
+    record_codec:
+      name: Recording Codec
+      required: false
+      description: 'How the clip is stored. h264 (default) transcodes the stream to a phone-friendly H.264 mp4 using record_scale and record_fps. copy stores the original camera stream without re-encoding (native resolution, no quality loss, little CPU); H.265 clips are tagged hvc1 so Apple devices play them. The clip starts at the first keyframe, so set a short keyframe interval on the camera.'
+      example: 'copy'
+      default: 'h264'
+      selector:
+        select:
+          options:
+            - "h264"
+            - "copy"
     include_filename:
       name: Include camera name
       required: true
