@@ -19,6 +19,7 @@ from custom_components.llmvision.stream_capture import (
     RECORD_CODEC_H264,
     build_hvc1_remux_cmd,
     build_stream_capture_cmd,
+    mp4_has_movie_fragment,
     mp4_video_sample_entry,
     normalize_record_codec,
 )
@@ -34,7 +35,9 @@ H264_ARGS_15FPS_1920 = [
     "-avoid_negative_ts", "make_zero", "-y", "/media/a.mp4",
 ]
 COPY_ARGS = [
-    "-t", "5", "-an", "-sn", "-dn", "-c:v", "copy", "-movflags", "+faststart",
+    "-t", "5", "-an", "-sn", "-dn", "-c:v", "copy",
+    "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+    "-frag_duration", "1000000", "-flush_packets", "1",
     "-avoid_negative_ts", "make_zero", "-y", "/media/a.mp4",
 ]
 
@@ -145,6 +148,11 @@ class TestClipArguments:
         assert cmd[cmd.index("-i") + 1] == "/media/a.mp4"
         assert cmd[-1] == "/media/a.hvc1-x.mp4"
         assert "-nostdin" in cmd and "+faststart" in cmd
+
+    def test_remux_cmd_without_tag(self):
+        cmd = build_hvc1_remux_cmd("/media/a.mp4", "/media/a.final-x.mp4", None)
+        assert "-tag:v" not in cmd
+        assert cmd[cmd.index("-c") + 1] == "copy" and "+faststart" in cmd
 
 
 # ---------------------------------------------------------------- add_streams
@@ -263,6 +271,41 @@ class TestMp4VideoSampleEntry:
         assert mp4_video_sample_entry(str(path)) is None
 
 
+def _fragmented_mp4(fragments=1, truncate=0):
+    """ftyp + empty moov + moof/mdat pairs, like a copy clip written by ffmpeg."""
+    data = _mp4(_trak(b"vide", b"hev1"), mdat=b"")[: -len(_box(b"mdat"))]
+    for _ in range(fragments):
+        data += _box(b"moof", _box(b"mfhd", b"\x00" * 8)) + _box(b"mdat", b"\x00" * 64)
+    return data[: len(data) - truncate] if truncate else data
+
+
+class TestMp4HasMovieFragment:
+    def test_header_only_clip_has_no_fragment(self, tmp_path):
+        path = tmp_path / "a.mp4"
+        path.write_bytes(_fragmented_mp4(fragments=0))
+        assert mp4_video_sample_entry(str(path)) == "hev1"
+        assert mp4_has_movie_fragment(str(path)) is False
+
+    def test_fragment_found_even_when_last_box_is_truncated(self, tmp_path):
+        path = tmp_path / "a.mp4"
+        path.write_bytes(_fragmented_mp4(fragments=2, truncate=20))
+        assert mp4_has_movie_fragment(str(path)) is True
+
+    def test_regular_mp4_has_no_fragment(self, tmp_path):
+        path = tmp_path / "a.mp4"
+        path.write_bytes(_mp4(_trak(b"vide", b"hvc1")))
+        assert mp4_has_movie_fragment(str(path)) is False
+
+    def test_fragment_without_sample_data_is_not_video(self, tmp_path):
+        path = tmp_path / "a.mp4"
+        header_only = _fragmented_mp4(fragments=0)
+        moof = _box(b"moof", _box(b"mfhd", b"\x00" * 8))
+        path.write_bytes(header_only + moof + _box(b"mdat"))
+        assert mp4_has_movie_fragment(str(path)) is False
+        path.write_bytes(header_only + moof)
+        assert mp4_has_movie_fragment(str(path)) is False
+
+
 # ---------------------------------------------------------------- hvc1 finalization
 
 
@@ -308,13 +351,42 @@ class TestFinalizeCopiedClip:
         exec_mock.assert_not_awaited()
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("entry", [b"hvc1", b"avc1"])
-    async def test_playable_entry_is_left_alone(self, processor, tmp_path, entry):
+    @pytest.mark.parametrize("entry,tag", [(b"hvc1", "hvc1"), (b"avc1", None)])
+    async def test_fragmented_clip_becomes_regular_mp4(
+        self, processor, tmp_path, entry, tag
+    ):
         processor.clip_codec = RECORD_CODEC_COPY
         clip = self._clip(tmp_path, entry)
+        regular = _mp4(_trak(b"vide", entry), mdat=b"\x01" * 32)
+        calls = []
+
+        async def _exec(*cmd, **kwargs):
+            calls.append(cmd)
+            tmp = _tmp_from(cmd)
+            return _Proc(on_run=lambda: open(tmp, "wb").write(regular))
+
+        with patch(EXEC, AsyncMock(side_effect=_exec)):
+            await processor._finalize_copied_clip(str(clip))
+        cmd = calls[0]
+        if tag:
+            assert cmd[cmd.index("-tag:v") + 1] == tag
+        else:
+            assert "-tag:v" not in cmd
+        assert clip.read_bytes() == regular
+        assert os.listdir(tmp_path) == ["clip.mp4"]
+
+    @pytest.mark.asyncio
+    async def test_clip_without_video_track_is_left_alone(
+        self, processor, tmp_path, caplog
+    ):
+        processor.clip_codec = RECORD_CODEC_COPY
+        clip = self._clip(tmp_path)
+        clip.write_bytes(_mp4(_trak(b"soun", b"mp4a")))
+        caplog.set_level(logging.WARNING, logger=media_handlers.__name__)
         with patch(EXEC, AsyncMock()) as exec_mock:
             await processor._finalize_copied_clip(str(clip))
         exec_mock.assert_not_awaited()
+        assert "no readable video track" in caplog.text
 
     @pytest.mark.asyncio
     async def test_hev1_is_retagged_in_place(self, processor, tmp_path):
@@ -357,7 +429,7 @@ class TestFinalizeCopiedClip:
             await processor._finalize_copied_clip(str(clip))
         assert clip.read_bytes() == original
         assert os.listdir(tmp_path) == ["clip.mp4"]
-        assert "hvc1 failed" in caplog.text
+        assert "Finalizing clip" in caplog.text and "failed" in caplog.text
 
     @pytest.mark.asyncio
     async def test_remux_without_effect_keeps_original(self, processor, tmp_path):
@@ -448,6 +520,54 @@ class TestRecordClipCopy:
         assert seen == [(out, [])]
         cmd = exec_mock.await_args.args
         assert cmd[cmd.index("-c:v") + 1] == "copy" and "-vf" not in cmd
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("fragments,kept", [(2, True), (0, False)])
+    async def test_timed_out_copy_clip_kept_only_with_video(
+        self, processor, tmp_path, fragments, kept
+    ):
+        processor.clip_codec = RECORD_CODEC_COPY
+        out = tmp_path / "clip.mp4"
+        finalized = []
+
+        async def _finalize(path):
+            finalized.append(path)
+
+        processor._finalize_copied_clip = _finalize
+        procs = []
+
+        async def _exec(*cmd, **kwargs):
+            out.write_bytes(_fragmented_mp4(fragments=fragments))
+            procs.append(_Proc(block=True))
+            return procs[0]
+
+        # communicate() is bounded by duration + 30 s: make it time out at once
+        with patch(SOURCE, AsyncMock(return_value="rtsp://x")), patch(
+            EXEC, AsyncMock(side_effect=_exec)
+        ):
+            result = await processor.record_clip(
+                ["camera.front"], -29.95, str(out), scale_width=0
+            )
+        procs[0].kill.assert_called_once()
+        assert result == ([str(out)] if kept else [])
+        assert finalized == ([str(out)] if kept else [])
+        assert out.exists() is kept
+
+    @pytest.mark.asyncio
+    async def test_timed_out_h264_clip_is_not_kept(self, processor, tmp_path):
+        out = tmp_path / "clip.mp4"
+
+        async def _exec(*cmd, **kwargs):
+            out.write_bytes(b"partial")
+            return _Proc(block=True)
+
+        with patch(SOURCE, AsyncMock(return_value="rtsp://x")), patch(
+            EXEC, AsyncMock(side_effect=_exec)
+        ):
+            result = await processor.record_clip(
+                ["camera.front"], -29.95, str(out), scale_width=1920
+            )
+        assert result == []
 
 
 # ---------------------------------------------------------------- real ffmpeg
@@ -574,3 +694,47 @@ class TestRealFfmpeg:
             capture_output=True, text=True,
         )
         assert probe.returncode == 0 and not probe.stderr
+
+    @pytest.mark.asyncio
+    async def test_killed_copy_recording_is_kept_and_finalized(
+        self, processor, tmp_path
+    ):
+        """A stalled stream gets ffmpeg killed: the fragments written stay usable."""
+        import signal
+        import time
+
+        source = tmp_path / "source.ts"
+        subprocess.run(
+            ["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+             "testsrc2=size=320x180:rate=15", "-t", "8", "-c:v", "libx265",
+             "-x265-params", "keyint=60:min-keyint=60:log-level=error",
+             "-f", "mpegts", str(source)],
+            check=True,
+        )
+        clip = tmp_path / "clip.mp4"
+        args = MediaProcessor._clip_output_args(8, None, str(clip), 0, "copy")
+        proc = subprocess.Popen(
+            ["ffmpeg", "-nostdin", "-v", "error", "-re", "-i", str(source), *args],
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(2.5)
+        proc.send_signal(signal.SIGKILL)
+        proc.wait()
+
+        processor.clip_codec = RECORD_CODEC_COPY
+        assert await processor._keep_partial_copy_clip(str(clip), "camera.front")
+        await processor._finalize_copied_clip(str(clip))
+        assert mp4_video_sample_entry(str(clip)) == "hvc1"
+        assert mp4_has_movie_fragment(str(clip)) is False
+        data = clip.read_bytes()
+        assert 0 < data.find(b"moov") < data.find(b"mdat")
+        duration = float(
+            subprocess.run(
+                ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                 "-of", "csv=p=0", str(clip)],
+                capture_output=True, text=True, check=True,
+            ).stdout
+        )
+        # keyframes only every 4 s: -frag_duration still kept about a second per fragment
+        assert duration >= 1.0
+        assert sorted(os.listdir(tmp_path)) == ["clip.mp4", "source.ts"]

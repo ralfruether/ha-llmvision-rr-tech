@@ -820,7 +820,7 @@ stream_analyzer_pro:
     record_codec:
       name: Recording Codec
       required: false
-      description: 'How the clip is stored. h264 (default) transcodes the stream to a phone-friendly H.264 mp4 using record_scale and record_fps. copy stores the original camera stream without re-encoding (native resolution, no quality loss, little CPU); H.265 clips are tagged hvc1 so Apple devices play them. The clip starts at the first keyframe, so set a short keyframe interval on the camera.'
+      description: 'How the clip is stored. h264 (default) transcodes the stream to a phone-friendly H.264 mp4 using record_scale and record_fps. copy stores the original camera stream without re-encoding (native resolution, no quality loss, little CPU); H.265 clips are tagged hvc1 so Apple devices play them. If the camera stream stalls, the part recorded until then is kept. The clip starts at the first keyframe, so set a short keyframe interval on the camera.'
       example: 'copy'
       default: 'h264'
       selector:

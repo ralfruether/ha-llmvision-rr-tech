@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Fixed `record_codec: copy` losing the whole clip when the camera stream stalls.
+  A stalled RTSP stream keeps the connection open, so ffmpeg ignores SIGTERM, is
+  killed after the stop timeout, and a regular mp4 has no index then; the clip was
+  deleted and the face service got `error:no_clip`. Copy clips are now written as
+  fragmented mp4 (a fragment at every keyframe and at least every second), so a
+  killed recording keeps everything up to the stall. After recording, every copy
+  clip is rewritten container-only into a regular `+faststart` mp4 (H.265 tagged
+  `hvc1` as before); if that fails, the playable fragmented clip is kept. A killed
+  clip without any fragment is still removed, and cancelled captures still delete
+  their clip. The `h264` transcode is unchanged. Verified with real ffmpeg against
+  a stalled RTSP stream (mediamtx with a frozen publisher): before, 22 MB without an
+  index; now a playable clip of the 5 s before the stall.
+
 ## 1.7.2.17 - 2026-10-04
 
 ### Added

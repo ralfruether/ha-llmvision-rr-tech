@@ -28,6 +28,8 @@ from .timeline import mark_key_frame_pending, release_key_frame
 from .stream_capture import (
     ALLOWED_CLIP_EXTENSIONS,
     ALLOWED_STREAM_SCHEMES,
+    COPY_CLIP_FRAG_DURATION_US,
+    COPY_CLIP_MOVFLAGS,
     FRAME_SOURCE_STREAM,
     MAX_FRAME_PIXELS,
     MAX_MALFORMED_FRAMES,
@@ -45,6 +47,7 @@ from .stream_capture import (
     build_hvc1_remux_cmd,
     build_stream_capture_cmd,
     coerce_number,
+    mp4_has_movie_fragment,
     mp4_video_sample_entry,
     normalize_frame_source,
     normalize_record_codec,
@@ -556,7 +559,9 @@ class MediaProcessor:
         correct H.264 level for the resolution, and uses a short keyframe
         interval so playback decodes smoothly. Frame timing is preserved
         (native) unless a record_fps is given to force a constant rate.
-        With record_codec "copy" the original video stream is stored unchanged.
+        With record_codec "copy" the original video stream is stored unchanged, as a
+        fragmented mp4 that stays playable if ffmpeg has to be killed;
+        _finalize_copied_clip turns it into a regular mp4.
         """
         if record_codec == RECORD_CODEC_COPY:
             return [
@@ -568,7 +573,12 @@ class MediaProcessor:
                 "-c:v",
                 "copy",
                 "-movflags",
-                "+faststart",
+                COPY_CLIP_MOVFLAGS,
+                "-frag_duration",
+                str(COPY_CLIP_FRAG_DURATION_US),
+                # write each fragment out at once instead of buffering it in ffmpeg
+                "-flush_packets",
+                "1",
                 "-avoid_negative_ts",
                 "make_zero",
                 "-y",
@@ -699,6 +709,11 @@ class MediaProcessor:
                     proc.kill()
                     await proc.wait()
                     _LOGGER.error(f"Clip recording for {camera_entity} timed out")
+                    if self.clip_codec == RECORD_CODEC_COPY and (
+                        await self._keep_partial_copy_clip(out_path, camera_entity)
+                    ):
+                        await self._finalize_copied_clip(out_path)
+                        written.append(out_path)
                     continue
                 if proc.returncode == 0 and os.path.exists(out_path):
                     await self._finalize_copied_clip(out_path)
@@ -727,12 +742,35 @@ class MediaProcessor:
         self.clip_paths = written
         return written
 
-    async def _finalize_copied_clip(self, clip_path):
-        """Make a stream-copied H.265 clip playable on Apple devices (hev1 -> hvc1).
+    async def _keep_partial_copy_clip(self, clip_path, camera_entity):
+        """After ffmpeg was killed: keep a fragmented copy clip that holds video.
 
-        Only the container is rewritten, into a temporary file next to the clip that
-        atomically replaces it. On any failure the original copy is kept (the face
-        service decodes hev1 as well) and a warning is logged.
+        Returns True when the clip has at least one movie fragment; otherwise the
+        file (only a header, or unreadable) is removed and False is returned.
+        """
+        try:
+            has_video = await self.hass.loop.run_in_executor(
+                None, mp4_has_movie_fragment, clip_path
+            )
+        except OSError:
+            has_video = False
+        if not has_video:
+            await self.hass.loop.run_in_executor(None, _remove_quietly, clip_path)
+            return False
+        _LOGGER.warning(
+            f"ffmpeg for {camera_entity} had to be stopped; kept the part of the "
+            f"clip recorded until then: {clip_path}"
+        )
+        return True
+
+    async def _finalize_copied_clip(self, clip_path):
+        """Turn a fragmented copy clip into a regular mp4 that Apple devices play.
+
+        Only the container is rewritten (H.265 is tagged hvc1 instead of ffmpeg's
+        default hev1, which Apple players reject), into a temporary file next to the
+        clip that atomically replaces it. On any failure the fragmented copy is kept
+        (it stays playable and the face service decodes it as well) and a warning is
+        logged.
         """
         if self.clip_codec != RECORD_CODEC_COPY:
             return
@@ -742,15 +780,18 @@ class MediaProcessor:
         except OSError as err:
             _LOGGER.warning(f"Could not inspect clip {clip_path}: {err}")
             return
-        if entry != "hev1":
+        if entry is None:
+            _LOGGER.warning(f"Clip {clip_path} has no readable video track; kept as is")
             return
+        tag = "hvc1" if entry in ("hev1", "hvc1") else None
+        expected = tag or entry
         root, ext = os.path.splitext(clip_path)
-        tmp_path = f"{root}.hvc1-{uuid.uuid4().hex[:12]}{ext}"
+        tmp_path = f"{root}.final-{uuid.uuid4().hex[:12]}{ext}"
         replaced = False
         proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
-                *build_hvc1_remux_cmd(clip_path, tmp_path),
+                *build_hvc1_remux_cmd(clip_path, tmp_path, tag),
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -759,7 +800,7 @@ class MediaProcessor:
                     proc.communicate(), timeout=REMUX_TIMEOUT
                 )
             except asyncio.TimeoutError:
-                _LOGGER.warning(f"Retagging clip {clip_path} as hvc1 timed out")
+                _LOGGER.warning(f"Finalizing clip {clip_path} timed out")
                 return
             if proc.returncode != 0:
                 detail = (
@@ -768,21 +809,20 @@ class MediaProcessor:
                     else "unknown error"
                 )
                 _LOGGER.warning(
-                    f"Retagging clip {clip_path} as hvc1 failed: "
-                    f"{redact(detail)[-1000:]}"
+                    f"Finalizing clip {clip_path} failed: {redact(detail)[-1000:]}"
                 )
                 return
             if (
                 await loop.run_in_executor(None, mp4_video_sample_entry, tmp_path)
-            ) != "hvc1":
-                _LOGGER.warning(f"Retagging clip {clip_path} as hvc1 had no effect")
+            ) != expected:
+                _LOGGER.warning(
+                    f"Finalizing clip {clip_path} did not produce a {expected} track"
+                )
                 return
             await loop.run_in_executor(None, os.replace, tmp_path, clip_path)
             replaced = True
         except Exception as err:
-            _LOGGER.warning(
-                f"Retagging clip {clip_path} as hvc1 failed: {redact(err)}"
-            )
+            _LOGGER.warning(f"Finalizing clip {clip_path} failed: {redact(err)}")
         finally:
             if proc is not None and proc.returncode is None:
                 try:
@@ -983,6 +1023,7 @@ class MediaProcessor:
         timed_out = False
         stop_now = False
         killed = False
+        completed = False
         try:
             while True:
                 limit = (
@@ -1052,6 +1093,7 @@ class MediaProcessor:
                 except asyncio.TimeoutError:
                     timed_out = True
             killed = await self._stop_process(proc)
+            completed = True
         except asyncio.CancelledError:
             if proc.returncode is None:
                 try:
@@ -1075,8 +1117,12 @@ class MediaProcessor:
                 await stderr_task
             except (asyncio.CancelledError, Exception):
                 pass
-            if clip_path and killed:
-                # A killed ffmpeg leaves an unplayable mp4 without its index
+            if clip_path and killed and (
+                not completed or self.clip_codec != RECORD_CODEC_COPY
+            ):
+                # A killed ffmpeg leaves an unplayable mp4 without its index (copy
+                # clips are fragmented and may be kept below, unless the capture
+                # was cancelled or failed)
                 try:
                     await self.hass.loop.run_in_executor(None, os.remove, clip_path)
                 except OSError:
@@ -1089,7 +1135,13 @@ class MediaProcessor:
                 f"Stream capture for {image_entity} ended early "
                 f"(returncode={returncode}, timed_out={timed_out}): {detail[-1000:]}"
             )
-        if clip_path and not killed:
+        if clip_path and killed:
+            if self.clip_codec == RECORD_CODEC_COPY and (
+                await self._keep_partial_copy_clip(clip_path, image_entity)
+            ):
+                await self._finalize_copied_clip(clip_path)
+                self.clip_paths.append(clip_path)
+        elif clip_path:
             try:
                 size = await self.hass.loop.run_in_executor(
                     None, os.path.getsize, clip_path

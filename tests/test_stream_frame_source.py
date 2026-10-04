@@ -647,6 +647,70 @@ class TestCaptureStreamCamera:
         assert not clip.exists()
         assert processor.clip_paths == []
 
+    @staticmethod
+    def _fragmented_clip(fragments):
+        def box(kind, payload=b""):
+            return (8 + len(payload)).to_bytes(4, "big") + kind + payload
+
+        data = box(b"ftyp", b"isom") + box(b"moov", box(b"mvhd", b"\x00" * 100))
+        for _ in range(fragments):
+            data += box(b"moof", box(b"mfhd", b"\x00" * 8)) + box(b"mdat", b"\x00" * 64)
+        return data
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("fragments,kept", [(2, True), (0, False)])
+    async def test_killed_copy_clip_kept_only_with_video(
+        self, processor, tmp_path, monkeypatch, caplog, fragments, kept
+    ):
+        # Stalled stream: ffmpeg ignores SIGTERM and is killed, the fragmented
+        # copy clip written so far stays playable
+        monkeypatch.setattr(media_handlers, "STREAM_STALL_TIMEOUT", 0.05)
+        monkeypatch.setattr(media_handlers, "PROCESS_STOP_TIMEOUT", 0.05)
+        processor.clip_codec = "copy"
+        clip = tmp_path / "a.mp4"
+        clip.write_bytes(self._fragmented_clip(fragments))
+        finalized = []
+
+        async def _finalize(path):
+            finalized.append((path, list(processor.clip_paths)))
+
+        processor._finalize_copied_clip = _finalize
+        proc = FakeProcess(
+            FakeStream([_jpeg("red")], block=True), ignore_terminate=True
+        )
+        caplog.set_level(logging.WARNING, logger=media_handlers.__name__)
+        result, _ = await self._capture(
+            processor, proc, clip_plan=(str(clip), None, 0)
+        )
+        assert result is not None
+        proc.kill.assert_called_once()
+        assert clip.exists() is kept
+        assert processor.clip_paths == ([str(clip)] if kept else [])
+        assert finalized == ([(str(clip), [])] if kept else [])
+        assert ("kept the part of the clip" in caplog.text) is kept
+
+    @pytest.mark.asyncio
+    async def test_cancellation_removes_copy_clip(self, processor, tmp_path):
+        processor.clip_codec = "copy"
+        clip = tmp_path / "a.mp4"
+        clip.write_bytes(self._fragmented_clip(2))
+        proc = FakeProcess(FakeStream([], block=True))
+        exec_mock, (p1, p2) = self._patches(proc)
+        with p1, p2:
+            task = asyncio.create_task(
+                processor._capture_stream_camera(
+                    image_entity="camera.front", camera_number=0, duration=5,
+                    frame_rate="1", frame_cap=16, target_width=2048,
+                    include_filename=True, clip_plan=(str(clip), None, 0),
+                )
+            )
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert not clip.exists()
+        assert processor.clip_paths == []
+
     @pytest.mark.asyncio
     async def test_frames_kept_when_wall_deadline_hits(self, processor, monkeypatch):
         monkeypatch.setattr(media_handlers, "STREAM_GRACE", 0.1)
@@ -669,9 +733,15 @@ class TestCaptureStreamCamera:
         assert loop.time() - started >= 0.25
 
     @pytest.mark.asyncio
-    async def test_unexpected_error_kills_process(self, processor, tmp_path):
+    @pytest.mark.parametrize("codec,scale", [("h264", 1920), ("copy", 0)])
+    async def test_unexpected_error_kills_process(
+        self, processor, tmp_path, codec, scale
+    ):
+        processor.clip_codec = codec
         clip = tmp_path / "a.mp4"
-        clip.write_bytes(b"partial")
+        clip.write_bytes(
+            self._fragmented_clip(2) if codec == "copy" else b"partial"
+        )
         processor.hass.loop.run_in_executor = AsyncMock(
             side_effect=lambda _e, func, *args: (
                 (_ for _ in ()).throw(RuntimeError("executor shut down"))
@@ -681,9 +751,10 @@ class TestCaptureStreamCamera:
         )
         proc = FakeProcess(FakeStream([_jpeg("red")], block=True), returncode=None)
         with pytest.raises(RuntimeError):
-            await self._capture(processor, proc, clip_plan=(str(clip), None, 1920))
+            await self._capture(processor, proc, clip_plan=(str(clip), None, scale))
         proc.kill.assert_called_once()
         assert not clip.exists()
+        assert processor.clip_paths == []
 
     @pytest.mark.asyncio
     async def test_malformed_stream_stops_promptly(self, processor, monkeypatch):

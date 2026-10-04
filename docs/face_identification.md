@@ -69,7 +69,9 @@ data:
   conditions the face service was evaluated on. Native clips are larger; keep
   `duration` short enough to stay under the 64 MB limit. Face labels keep their
   timing: the copied clip and the analyzed frames come from the same ffmpeg session
-  and both start at the stream's first keyframe.
+  and both start at the stream's first keyframe. If the stream stalls and ffmpeg
+  has to be stopped, the copied clip keeps (and the face service receives) the part
+  recorded until then.
 - A label uses the face sample closest to the time the frame actually shows within
   ±0.25 s; the box is the detected face enlarged about 1.6× to cover the head. ffmpeg's
   `fps=` filter keeps the last frame of each slot, so frame n shows the scene at about

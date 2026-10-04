@@ -32,6 +32,13 @@ ALLOWED_CLIP_EXTENSIONS = (".mp4", ".m4v", ".mov")
 MAX_MP4_MOOV_BYTES = 32 * 1024 * 1024
 MAX_MP4_TOP_LEVEL_BOXES = 64
 REMUX_TIMEOUT = 60.0
+# Copy clips are written as fragmented MP4: when ffmpeg has to be killed (e.g. a
+# stalled camera stream ignores SIGTERM) the fragments written so far stay playable.
+# A fragment is cut at every keyframe and at least every second (bounds the loss on
+# cameras with a long keyframe interval). _finalize_copied_clip then rewrites the
+# clip into a regular +faststart MP4.
+COPY_CLIP_MOVFLAGS = "+frag_keyframe+empty_moov+default_base_moof"
+COPY_CLIP_FRAG_DURATION_US = 1_000_000
 
 # Resource bounds for untrusted stream data
 MAX_STREAM_FRAMES = 300
@@ -163,6 +170,34 @@ def _video_sample_entry(moov) -> str | None:
     return None
 
 
+def _iter_top_level_boxes(fh, file_size):
+    """Yield (type, payload_start, size, header) for the first top-level MP4 boxes.
+
+    Bounded by MAX_MP4_TOP_LEVEL_BOXES; stops at the first malformed header. A
+    truncated last box (e.g. after ffmpeg was killed) is still yielded.
+    """
+    pos = 0
+    for _ in range(MAX_MP4_TOP_LEVEL_BOXES):
+        if pos + 8 > file_size:
+            return
+        fh.seek(pos)
+        head = fh.read(16)
+        size = int.from_bytes(head[:4], "big")
+        kind = head[4:8]
+        header = 8
+        if size == 1:
+            if len(head) < 16:
+                return
+            size = int.from_bytes(head[8:16], "big")
+            header = 16
+        elif size == 0:
+            size = file_size - pos
+        if size < header:
+            return
+        yield kind, pos + header, size, header
+        pos += size
+
+
 def mp4_video_sample_entry(path) -> str | None:
     """Sample entry type of the first video track ('hvc1', 'hev1', 'avc1', ...).
 
@@ -171,38 +206,42 @@ def mp4_video_sample_entry(path) -> str | None:
     """
     with open(path, "rb") as fh:
         file_size = os.fstat(fh.fileno()).st_size
-        pos = 0
-        for _ in range(MAX_MP4_TOP_LEVEL_BOXES):
-            if pos + 8 > file_size:
-                return None
-            fh.seek(pos)
-            head = fh.read(16)
-            size = int.from_bytes(head[:4], "big")
-            kind = head[4:8]
-            header = 8
-            if size == 1:
-                if len(head) < 16:
-                    return None
-                size = int.from_bytes(head[8:16], "big")
-                header = 16
-            elif size == 0:
-                size = file_size - pos
-            if size < header:
-                return None
+        for kind, payload, size, header in _iter_top_level_boxes(fh, file_size):
             if kind == b"moov":
                 if size - header > MAX_MP4_MOOV_BYTES:
                     return None
-                fh.seek(pos + header)
+                fh.seek(payload)
                 return _video_sample_entry(fh.read(size - header))
-            pos += size
     return None
 
 
-def build_hvc1_remux_cmd(src_path, dst_path) -> list[str]:
-    """ffmpeg command that rewrites only the container: H.265 sample entry hev1 -> hvc1.
+def mp4_has_movie_fragment(path) -> bool:
+    """True when a fragmented MP4 holds a movie fragment with sample data.
 
-    Apple players reject hev1, which is ffmpeg's default tag for H.265 in MP4.
+    A copy clip written with COPY_CLIP_MOVFLAGS starts with an empty moov; samples
+    only exist once a moof followed by a non-empty mdat was written (the mdat may be
+    truncated when ffmpeg was killed). Blocking I/O; call from an executor.
     """
+    with open(path, "rb") as fh:
+        file_size = os.fstat(fh.fileno()).st_size
+        seen_moof = False
+        for kind, payload, size, header in _iter_top_level_boxes(fh, file_size):
+            if kind == b"moof":
+                seen_moof = True
+            elif kind == b"mdat" and seen_moof:
+                if min(payload - header + size, file_size) > payload:
+                    return True
+        return False
+
+
+def build_hvc1_remux_cmd(src_path, dst_path, tag="hvc1") -> list[str]:
+    """ffmpeg command that rewrites only the container into a regular +faststart MP4.
+
+    With tag "hvc1" the H.265 sample entry hev1 becomes hvc1: Apple players reject
+    hev1, which is ffmpeg's default tag for H.265 in MP4. tag=None keeps the codec
+    tag (used to turn a fragmented H.264 copy clip into a regular MP4).
+    """
+    tag_args = ["-tag:v", tag] if tag else []
     return [
         "ffmpeg",
         "-nostdin",
@@ -215,8 +254,7 @@ def build_hvc1_remux_cmd(src_path, dst_path) -> list[str]:
         "0:v:0",
         "-c",
         "copy",
-        "-tag:v",
-        "hvc1",
+        *tag_args,
         "-movflags",
         "+faststart",
         "-y",
