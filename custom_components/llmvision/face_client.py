@@ -89,6 +89,28 @@ class FacePerson:
     samples: tuple[FaceSample, ...] = ()
 
 
+@dataclass(frozen=True)
+class AppearanceMatch:
+    """A person named by appearance (mostly clothing), not by face. Shadow mode: reported
+    only, never added to the prompt, the frame labels or `persons`."""
+
+    name: str
+    score: float
+    tier: str
+    qualifies: bool
+    seed_face_score: float
+    seed_age_s: float
+    same_camera: bool
+
+
+@dataclass(frozen=True)
+class AppearanceInfo:
+    status: str
+    matches: tuple[AppearanceMatch, ...] = ()
+    person_tracks: int | None = None
+    unnamed_tracks: int | None = None
+
+
 @dataclass
 class FaceResult:
     camera: str
@@ -97,6 +119,7 @@ class FaceResult:
     has_faces: bool = False
     has_unknown: bool = False
     elapsed_ms: int = 0
+    appearance: AppearanceInfo | None = field(default=None, repr=False)
 
     @property
     def ok(self) -> bool:
@@ -292,15 +315,135 @@ def _reject_constant(_value):
     raise ValueError("non-finite number")
 
 
-def decode_identify_body(body: bytes) -> tuple[list[FacePerson], bool, bool]:
-    """Decode and validate a response body; never echoes its content."""
+APPEARANCE_STATUSES = {"ok", "skipped", "disabled", "error"}
+APPEARANCE_TIERS = {"strong", "weak"}
+MAX_TRACKS = 1000
+MAX_SEED_AGE = 86400.0
+# A match may only ever "qualify" with a strong seed of at most this age, whatever the
+# service reports (decision of 2026-10-06; defense in depth for a later alarm gate).
+QUALIFY_MIN_SEED_SCORE = 0.50
+QUALIFY_MAX_SEED_AGE = 3600.0
+
+
+def _bounded_int(value, upper: int) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= upper:
+        return None
+    return value
+
+
+def _parse_appearance_match(raw, face_names) -> AppearanceMatch | None:
+    if not isinstance(raw, dict):
+        return None
+    name = raw.get("name")
+    if not isinstance(name, str) or NAME_PATTERN.fullmatch(name) is None or name in face_names:
+        return None
+    score = _finite_number(raw.get("score"))
+    tier = raw.get("tier")
+    qualifies = raw.get("qualifies")
+    seed = raw.get("seed")
+    if (
+        score is None
+        or not 0.0 <= score <= 1.0
+        or not isinstance(tier, str)
+        or tier not in APPEARANCE_TIERS
+        or not isinstance(qualifies, bool)
+        or not isinstance(seed, dict)
+    ):
+        return None
+    face_score = _finite_number(seed.get("face_score"))
+    age = _finite_number(seed.get("age_s"))
+    same_camera = seed.get("same_camera")
+    if (
+        face_score is None
+        or not 0.0 <= face_score <= 1.0
+        or age is None
+        or not 0.0 <= age <= MAX_SEED_AGE
+        or not isinstance(same_camera, bool)
+    ):
+        return None
+    qualifies = (
+        qualifies
+        and tier == "strong"
+        and face_score >= QUALIFY_MIN_SEED_SCORE
+        and age <= QUALIFY_MAX_SEED_AGE
+    )
+    return AppearanceMatch(
+        name=name,
+        score=score,
+        tier=tier,
+        qualifies=qualifies,
+        seed_face_score=face_score,
+        seed_age_s=age,
+        same_camera=same_camera,
+    )
+
+
+def parse_appearance_payload(payload, face_names=()) -> AppearanceInfo | None:
+    """Validate the optional re-identification part of a /v1/identify body.
+
+    Returns None when the service reported no (or an invalid) appearance part; the face
+    result is never affected. Names that face recognition reported are ignored.
+    """
+    try:
+        return _parse_appearance(payload, set(face_names))
+    except Exception:  # noqa: BLE001 - a broken optional part must never fail the face result
+        return None
+
+
+def _parse_appearance(payload, face_names: set) -> AppearanceInfo | None:
+    if not isinstance(payload, dict) or "reid" not in payload:
+        return None
+    status = payload.get("reid")
+    if not isinstance(status, str) or status not in APPEARANCE_STATUSES:
+        return None
+    if status != "ok":  # counts are only meaningful when matching ran (the service sends null)
+        return AppearanceInfo(status=status)
+    matches_raw = payload.get("appearance_matches")
+    persons = _bounded_int(payload.get("person_tracks"), MAX_TRACKS)
+    unnamed = _bounded_int(payload.get("unnamed_tracks"), MAX_TRACKS)
+    if (
+        not isinstance(matches_raw, list)
+        or persons is None
+        or unnamed is None
+        or unnamed > persons
+    ):
+        return None
+    matches = []
+    seen = set()
+    for raw in matches_raw:
+        match = _parse_appearance_match(raw, face_names)
+        if match is None or match.name in seen:
+            continue
+        seen.add(match.name)
+        matches.append(match)
+        if len(matches) >= MAX_PERSONS:
+            break
+    return AppearanceInfo(
+        status=status,
+        matches=tuple(matches),
+        person_tracks=persons,
+        unnamed_tracks=unnamed,
+    )
+
+
+def decode_identify_response(
+    body: bytes,
+) -> tuple[list[FacePerson], bool, bool, AppearanceInfo | None]:
+    """Decode a response body: face result plus the optional appearance part."""
     if len(body) > MAX_RESPONSE_BYTES:
         raise FaceServiceError(REASON_INVALID_RESPONSE)
     try:
         payload = json.loads(body, parse_constant=_reject_constant)
     except (ValueError, UnicodeDecodeError, RecursionError) as err:
         raise FaceServiceError(REASON_INVALID_RESPONSE) from err
-    return parse_identify_payload(payload)
+    persons, has_faces, has_unknown = parse_identify_payload(payload)
+    appearance = parse_appearance_payload(payload, {p.name for p in persons})
+    return persons, has_faces, has_unknown, appearance
+
+
+def decode_identify_body(body: bytes) -> tuple[list[FacePerson], bool, bool]:
+    """Decode and validate a response body; never echoes its content."""
+    return decode_identify_response(body)[:3]
 
 
 # ------------------------------------------------------------------ request
@@ -373,7 +516,7 @@ async def _async_post_clip(hass, settings: FaceSettings, camera: str, clip: byte
         if (response.content_type or "").lower() != "application/json":
             raise FaceServiceError(REASON_INVALID_RESPONSE)
         body = await _read_limited(response)
-    return decode_identify_body(body)
+    return decode_identify_response(body)
 
 
 def error_result(camera: str, reason: str, elapsed_ms: int = 0) -> FaceResult:
@@ -400,7 +543,7 @@ async def async_identify(
     try:
         if clip_data is None:
             clip_data = await async_load_clip(hass, clip_path)
-        persons, has_faces, has_unknown = await _async_post_clip(
+        persons, has_faces, has_unknown, appearance = await _async_post_clip(
             hass, settings, camera, clip_data
         )
     except asyncio.CancelledError:
@@ -421,6 +564,7 @@ async def async_identify(
             has_faces=has_faces,
             has_unknown=has_unknown,
             elapsed_ms=_elapsed_ms(started),
+            appearance=appearance,
         )
     return error_result(camera, reason, _elapsed_ms(started))
 
@@ -558,3 +702,51 @@ def service_response_fields(enabled: bool, results) -> dict:
         status = STATUS_OK
     elapsed = max((result.elapsed_ms for result in results), default=0)
     return {"persons": persons, "face_service": status, "face_service_ms": elapsed}
+
+
+REID_UNAVAILABLE = "unavailable"
+
+
+def appearance_response_fields(enabled: bool, results) -> dict:
+    """Shadow-mode re-identification fields for the service response.
+
+    appearance_persons: best appearance match per name over all clips (never a name face
+    recognition reported). person_tracks / unnamed_tracks are summed over the clips and are
+    None unless every clip reported ReID counts, so a check such as
+    "unnamed_tracks == 0" can never pass on missing data.
+    """
+    results = list(results or [])
+    infos = [result.appearance if result.ok else None for result in results]
+    if not enabled or not infos:
+        status = STATUS_DISABLED if not enabled else REID_UNAVAILABLE
+        return {"appearance_persons": [], "person_tracks": None, "unnamed_tracks": None,
+                "reid": status}
+    face_names, _ = _identified(results)
+    best: dict[str, AppearanceMatch] = {}
+    for info in infos:
+        for match in info.matches if info else ():
+            if match.name in face_names:
+                continue
+            current = best.get(match.name)
+            if current is None or (match.qualifies, match.score) > (current.qualifies, current.score):
+                best[match.name] = match
+    complete = all(info is not None and info.unnamed_tracks is not None for info in infos)
+    statuses = [info.status if info else REID_UNAVAILABLE for info in infos]
+    status = next((s for s in statuses if s != "ok"), "ok")
+    return {
+        "appearance_persons": [
+            {
+                "name": m.name,
+                "score": round(m.score, SCORE_DECIMALS),
+                "tier": m.tier,
+                "qualifies": m.qualifies,
+                "seed_face_score": round(m.seed_face_score, SCORE_DECIMALS),
+                "seed_age_s": round(m.seed_age_s),
+                "same_camera": m.same_camera,
+            }
+            for m in sorted(best.values(), key=lambda m: (-m.score, m.name))
+        ],
+        "person_tracks": sum(i.person_tracks for i in infos) if complete else None,
+        "unnamed_tracks": sum(i.unnamed_tracks for i in infos) if complete else None,
+        "reid": status,
+    }

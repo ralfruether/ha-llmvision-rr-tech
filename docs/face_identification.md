@@ -89,6 +89,28 @@ With `identify_persons: true` the service response additionally contains:
   `too_large` or `no_clip` (the first failure when several clips were sent)
 - `face_service_ms`: duration of the longest identification request
 
+Appearance re-identification (shadow mode, only when the face service runs with
+`[reid] enabled = true`). These fields are **reported only**: appearance names never
+reach `persons`, the prompt or the frame labels, and they must not be used to silence or
+trigger alarms until the shadow evaluation is finished:
+
+- `appearance_persons`: `[{"name", "score", "tier", "qualifies", "seed_face_score",
+  "seed_age_s", "same_camera"}, …]`, the best appearance match per name over all clips.
+  The service names a person track without a usable face this way when its appearance
+  (mostly clothing) closely matches a person the face service recognized shortly before.
+  `tier` is `strong` when that earlier face score was >= 0.50, else `weak`; `qualifies`
+  is true for a strong match at most one hour old (the client enforces both limits itself,
+  whatever the service reports). Names in `persons` are never repeated.
+- `person_tracks` / `unnamed_tracks`: persons seen in the clips, and those without a face
+  name and without a qualifying appearance match (summed over clips). Both are `null`
+  when any clip has no appearance data, so `unnamed_tracks == 0` never passes on missing
+  data. Safe template check:
+  `{{ ai_response.get('reid') == 'ok' and ai_response.get('unnamed_tracks') is number and ai_response.get('unnamed_tracks') == 0 }}`
+- `reid`: `ok`, `skipped` (the face service ran out of time for it), `error`,
+  `unavailable` (the service sent no appearance data or the identification failed) or
+  `disabled` (face service not configured); with several clips the first status that is
+  not `ok`.
+
 With `debug_polylines: true`, every annotated frame in `debug` also lists the drawn
 `faces` (`name` and pixel `box`).
 
@@ -114,6 +136,11 @@ With `debug_polylines: true`, every annotated frame in `debug` also lists the dr
 - **Not for security actions.** The face service has no liveness check; a printed
   photo or a screen can be recognized as a household member. Never use the
   identities to unlock doors, disarm alarms or trigger other security actions.
+- **Appearance matches are not identities.** They rest mostly on clothing: someone
+  dressed like a household member, or a person seen right after a wrongly recognized
+  face, can be named. They stay out of the prompt, the labels and the cloud, and are
+  reported for evaluation only. Whole-body matching is personal data too; inform the
+  household and regular visitors.
 - **Plain HTTP in the LAN.** With an `http://` URL the clip and the bearer token are
   sent unencrypted; anyone able to read LAN traffic can capture them. Prefer
   `https://` or an isolated network segment. The token is stored in the Home

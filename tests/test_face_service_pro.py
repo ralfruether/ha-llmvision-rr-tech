@@ -642,6 +642,40 @@ class TestHandlers:
         assert "identify_id" not in messages[0]
 
     @pytest.mark.asyncio
+    async def test_video_appearance_reported_but_not_prompted(self, caplog):
+        result_obj = _ok_result(has_unknown=True)
+        result_obj.appearance = face_client.AppearanceInfo(
+            status="ok",
+            matches=(
+                face_client.AppearanceMatch("ralf", 0.93, "strong", True, 0.61, 300.0, False),
+            ),
+            person_tracks=2,
+            unnamed_tracks=0,
+        )
+        processor, request_obj, messages = _mock_processor([result_obj], labeled=True)
+        result, _ = await _run(
+            "video_analyzer_pro", {**BASE, "identify_persons": True}, processor, request_obj
+        )
+        assert "ralf" not in messages[0] and '"lea"' in messages[0]
+        assert result["persons"] == [{"name": "lea", "score": 0.756}]
+        assert result["appearance_persons"] == [
+            {"name": "ralf", "score": 0.93, "tier": "strong", "qualifies": True,
+             "seed_face_score": 0.61, "seed_age_s": 300, "same_camera": False}
+        ]
+        assert result["person_tracks"] == 2 and result["unnamed_tracks"] == 0
+        assert result["reid"] == "ok"
+        assert "ralf" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_video_without_reid_data_reports_null_counts(self):
+        processor, request_obj, _ = _mock_processor([_ok_result()])
+        result, _ = await _run(
+            "video_analyzer_pro", {**BASE, "identify_persons": True}, processor, request_obj
+        )
+        assert result["appearance_persons"] == [] and result["reid"] == "unavailable"
+        assert result["person_tracks"] is None and result["unnamed_tracks"] is None
+
+    @pytest.mark.asyncio
     async def test_video_error_leaves_message_unchanged(self):
         failure = FaceResult(camera="c", status="error:http_503", elapsed_ms=5)
         processor, request_obj, messages = _mock_processor([failure])
@@ -665,6 +699,7 @@ class TestHandlers:
         )
         assert messages == [VIDEO_PREFIX]
         assert result["face_service"] == "disabled"
+        assert result["reid"] == "disabled" and result["unnamed_tracks"] is None
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("value", [None, False, "true"])

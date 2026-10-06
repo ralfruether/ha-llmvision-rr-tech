@@ -732,10 +732,12 @@ def _append_face_facts(call, processor) -> None:
 
 def _add_face_response(call, processor, response: dict) -> None:
     if _face_requested(call):
+        enabled = processor.face_settings is not None
         response.update(
-            face_client.service_response_fields(
-                processor.face_settings is not None, processor.face_results
-            )
+            face_client.service_response_fields(enabled, processor.face_results)
+        )
+        response.update(
+            face_client.appearance_response_fields(enabled, processor.face_results)
         )
 
 

@@ -713,3 +713,223 @@ def test_fps_frame_time_matches_ffmpeg_fps_filter():
     assert face_client.fps_frame_time(0, 1.0) == 0.5
     assert face_client.fps_frame_time(6, 1.0) == 6.5
     assert face_client.fps_frame_time(3, 2.0) == 1.75
+
+
+# ------------------------------------------------------------------ appearance (ReID shadow)
+
+APPEARANCE = {
+    "reid": "ok",
+    "person_tracks": 3,
+    "unnamed_tracks": 1,
+    "appearance_matches": [
+        {
+            "name": "ralf",
+            "score": 0.931,
+            "tier": "strong",
+            "qualifies": True,
+            "seed": {"face_score": 0.62, "age_s": 420.5, "same_camera": False},
+            "samples": [{"t": 3.0, "box": [0.1, 0.2, 0.3, 0.9]}],
+        },
+        {
+            "name": "anke",
+            "score": 0.905,
+            "tier": "weak",
+            "qualifies": False,
+            "seed": {"face_score": 0.47, "age_s": 30, "same_camera": True},
+        },
+    ],
+}
+
+
+def _match(**overrides):
+    match = json.loads(json.dumps(APPEARANCE["appearance_matches"][0]))
+    seed = overrides.pop("seed", {})
+    match.update(overrides)
+    match["seed"].update(seed)
+    return match
+
+
+def _appearance(**overrides):
+    return {**_payload([_person("lea")]), **APPEARANCE, **overrides}
+
+
+class TestAppearancePayload:
+    def test_real_response(self):
+        info = face_client.parse_appearance_payload(_appearance(), {"lea"})
+        assert info.status == "ok" and info.person_tracks == 3 and info.unnamed_tracks == 1
+        assert [m.name for m in info.matches] == ["ralf", "anke"]
+        ralf = info.matches[0]
+        assert (ralf.tier, ralf.qualifies, ralf.seed_face_score, ralf.seed_age_s) == (
+            "strong", True, 0.62, 420.5
+        )
+        assert info.matches[1].same_camera is True
+
+    def test_absent_means_no_reid(self):
+        assert face_client.parse_appearance_payload(REAL_RESPONSE) is None
+        assert face_client.parse_appearance_payload([]) is None
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"name": "Ralf"},
+            {"name": "x" * 60},
+            {"score": float("nan")},
+            {"score": float("inf")},
+            {"score": True},
+            {"score": "0.9"},
+            {"score": None},
+            {"score": 1.5},
+            {"tier": "medium"},
+            {"qualifies": 1},
+            {"qualifies": "true"},
+            {"seed": {"face_score": 1.2}},
+            {"seed": {"age_s": -1}},
+            {"seed": {"age_s": 1e9}},
+            {"seed": {"same_camera": "no"}},
+        ],
+    )
+    def test_invalid_match_dropped(self, overrides):
+        body = _appearance(appearance_matches=[_match(**overrides)])
+        info = face_client.parse_appearance_payload(body)
+        assert info is not None and info.matches == ()
+
+    def test_missing_seed_dropped(self):
+        match = _match()
+        del match["seed"]
+        info = face_client.parse_appearance_payload(_appearance(appearance_matches=[match]))
+        assert info.matches == ()
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"reid": "maybe"},
+            {"appearance_matches": {}},
+            {"person_tracks": -1},
+            {"person_tracks": 1001},
+            {"person_tracks": True},
+            {"person_tracks": 2.0},
+            {"unnamed_tracks": None},
+            {"unnamed_tracks": 4},  # more than person_tracks
+        ],
+    )
+    def test_invalid_structure_ignored(self, overrides):
+        assert face_client.parse_appearance_payload(_appearance(**overrides)) is None
+
+    @pytest.mark.parametrize("value", [["ok"], {"ok": 1}, 1, None])
+    def test_unhashable_or_wrong_status_never_raises(self, value):
+        assert face_client.parse_appearance_payload(_appearance(reid=value)) is None
+
+    @pytest.mark.parametrize("value", [["strong"], {"a": 1}, 1])
+    def test_unhashable_tier_drops_only_the_match(self, value):
+        body = _appearance(appearance_matches=[_match(tier=value), _match(name="anke")])
+        info = face_client.parse_appearance_payload(body)
+        assert [m.name for m in info.matches] == ["anke"]
+
+    def test_skipped_with_null_counts_is_accepted(self):
+        body = _appearance(reid="skipped", person_tracks=None, unnamed_tracks=None,
+                           appearance_matches=[])
+        assert face_client.parse_appearance_payload(body) == face_client.AppearanceInfo(
+            status="skipped"
+        )
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [{"tier": "weak"}, {"seed": {"face_score": 0.47}}, {"seed": {"age_s": 3601}}],
+    )
+    def test_qualifies_is_rechecked_by_the_client(self, overrides):
+        body = _appearance(appearance_matches=[_match(qualifies=True, **overrides)])
+        (match,) = face_client.parse_appearance_payload(body).matches
+        assert match.qualifies is False
+
+    def test_not_ok_status_has_no_counts(self):
+        info = face_client.parse_appearance_payload(_appearance(reid="skipped"))
+        assert info == face_client.AppearanceInfo(status="skipped")
+
+    def test_face_names_duplicates_and_cap(self):
+        matches = [_match(name="lea"), _match(), _match(score=0.95)]
+        matches += [_match(name=f"p{chr(97 + i)}") for i in range(15)]
+        info = face_client.parse_appearance_payload(
+            _appearance(appearance_matches=matches), {"lea"}
+        )
+        assert info.matches[0].name == "ralf" and info.matches[0].score == 0.931
+        assert "lea" not in {m.name for m in info.matches}
+        assert len(info.matches) == face_client.MAX_PERSONS
+
+    def test_broken_appearance_keeps_face_result(self):
+        body = json.dumps(_appearance(person_tracks="x")).encode()
+        persons, has_faces, _, appearance = face_client.decode_identify_response(body)
+        assert [p.name for p in persons] == ["lea"] and has_faces and appearance is None
+        assert len(face_client.decode_identify_body(body)) == 3
+
+    @pytest.mark.asyncio
+    async def test_identify_passes_appearance_and_keeps_persons(self, caplog):
+        body = json.dumps({**REAL_RESPONSE, **APPEARANCE}).encode()
+        result, _ = await _identify(FakeResponse(body=body), caplog)
+        assert [p.name for p in result.persons] == ["lea", "anke"]
+        assert [m.name for m in result.appearance.matches] == ["ralf"]  # anke is a face name
+        assert "ralf" not in caplog.text
+
+
+class TestAppearanceResponse:
+    def _ok(self, *faces, matches=(), persons=2, unnamed=1, status="ok"):
+        info = face_client.AppearanceInfo(
+            status=status,
+            matches=tuple(matches),
+            person_tracks=persons if status == "ok" else None,
+            unnamed_tracks=unnamed if status == "ok" else None,
+        )
+        return FaceResult(
+            camera="c",
+            status="ok",
+            persons=[FacePerson(n, 0.6) for n in faces],
+            has_faces=bool(faces),
+            appearance=info,
+        )
+
+    @staticmethod
+    def _m(name, score, qualifies=True, tier="strong"):
+        return face_client.AppearanceMatch(name, score, tier, qualifies, 0.6123, 61.4, False)
+
+    def test_merge_best_per_name_and_sum_counts(self):
+        a = self._ok(matches=[self._m("ralf", 0.95, qualifies=False, tier="weak")])
+        b = self._ok("lea", matches=[self._m("ralf", 0.91), self._m("anke", 0.93)], unnamed=0)
+        fields = face_client.appearance_response_fields(True, [a, b])
+        assert fields == {
+            "appearance_persons": [
+                {"name": "anke", "score": 0.93, "tier": "strong", "qualifies": True,
+                 "seed_face_score": 0.612, "seed_age_s": 61, "same_camera": False},
+                {"name": "ralf", "score": 0.91, "tier": "strong", "qualifies": True,
+                 "seed_face_score": 0.612, "seed_age_s": 61, "same_camera": False},
+            ],
+            "person_tracks": 4,
+            "unnamed_tracks": 1,
+            "reid": "ok",
+        }
+
+    def test_face_name_in_another_clip_wins(self):
+        a = self._ok("ralf")
+        b = self._ok(matches=[self._m("ralf", 0.95)])
+        assert face_client.appearance_response_fields(True, [a, b])["appearance_persons"] == []
+
+    def test_missing_data_makes_counts_none(self):
+        no_reid = FaceResult(camera="c", status="ok")
+        error = FaceResult(camera="c", status="error:timeout")
+        for other, status in ((no_reid, "unavailable"), (error, "unavailable"),
+                              (self._ok(status="skipped"), "skipped")):
+            fields = face_client.appearance_response_fields(True, [self._ok(), other])
+            assert fields["person_tracks"] is None and fields["unnamed_tracks"] is None
+            assert fields["reid"] == status
+
+    def test_disabled_and_no_results_have_same_keys(self):
+        keys = {"appearance_persons", "person_tracks", "unnamed_tracks", "reid"}
+        disabled = face_client.appearance_response_fields(False, [self._ok()])
+        empty = face_client.appearance_response_fields(True, [])
+        assert set(disabled) == set(empty) == keys
+        assert disabled["reid"] == "disabled" and empty["reid"] == "unavailable"
+        assert disabled["unnamed_tracks"] is None and empty["appearance_persons"] == []
+        json.dumps(disabled)
+
+    def test_appearance_never_reaches_the_prompt(self):
+        result = self._ok("lea", matches=[self._m("ralf", 0.99)])
+        text = face_client.build_fact_text([result], {"lea"})
+        assert "ralf" not in text and '"lea"' in text

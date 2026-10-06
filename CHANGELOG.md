@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Added appearance re-identification fields to the `identify_persons` service
+  response (shadow mode): `appearance_persons` (best match per name with `score`,
+  `tier`, `qualifies`, `seed_face_score`, `seed_age_s`, `same_camera`),
+  `person_tracks`, `unnamed_tracks` and `reid`. They come from the face service's
+  new optional `[reid]` mode, which names person tracks without a usable face when
+  their appearance (mostly clothing) closely matches someone the face service
+  recognized shortly before. The client validates them strictly and separately from
+  `persons`: an invalid appearance part is ignored without affecting the face result.
+  Appearance names never reach `persons`, the prompt or the frame labels. The track
+  counts are `null` whenever a clip has no appearance data, so a check such as
+  `unnamed_tracks == 0` cannot pass on missing data. See
+  `docs/face_identification.md`.
+
 ## 1.7.2.18 - 2026-10-04
 
 ### Fixed
