@@ -56,12 +56,12 @@ data:
   `camera.` or the video file stem (for generic names such as `clip.mp4` the parent
   folder name before the first `_<digit>`).
 - In stream mode the request runs while the camera's capture lock is still held, so
-  a follow-up capture of the same camera can start up to 12 seconds later.
+  a follow-up capture of the same camera can start up to 20 seconds later.
 - Clips larger than 64 MB are not uploaded (`error:too_large`), and only ISO-BMFF
   video files (mp4/m4v/mov with an `ftyp` header) are ever sent (`error:no_clip`
   otherwise). In snapshot mode the clip is read while the camera lock is still held,
   so a follow-up capture to the same `clip_path` cannot replace it before upload.
-  The request has a total timeout of 12 seconds, follows no redirects and accepts
+  The request has a total timeout of 20 seconds, follows no redirects and accepts
   at most 256 KiB of JSON.
 - `stream_analyzer_pro` transcodes the clip to H.264 capped at 1920 px by default.
   With `record_codec: copy` the face service receives the original camera stream
@@ -123,6 +123,23 @@ With `debug_polylines: true`, every annotated frame in `debug` also lists the dr
 - With `debug_polylines: true`, the annotated frames, including name labels, are
   written to `/media/llmvision/snapshots/debug-*.jpg` just like the polyline debug
   frames. Delete them when no longer needed.
+- `llmvision.store_analysis_record` writes an `analysis.json` into a directory below
+  `/media/llmvision` (for example the `storage_path` evidence directory), so the
+  automation's decision and the complete analyzer response (LLM result, `persons`,
+  appearance fields) are kept next to the clip and snapshots for later analysis:
+
+  ```yaml
+  - action: llmvision.store_analysis_record
+    continue_on_error: true
+    data:
+      directory: "{{ evidence_directory }}"
+      record: "{{ {'notification_level': notification_level, 'ai_response': ai_response} | to_json }}"
+  ```
+
+  `record` is a JSON object or a JSON string of one (at most 4 MB); the file is
+  replaced atomically. Paths outside `/media/llmvision` are rejected. The record
+  contains names and the model's descriptions of people: it is personal data and is
+  kept as long as the evidence directory.
 
 ## Privacy and security
 

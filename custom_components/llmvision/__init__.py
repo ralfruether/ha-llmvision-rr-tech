@@ -5,7 +5,7 @@ from .timeline import Timeline
 from .providers import Request
 from .memory import Memory
 from .media_handlers import MediaProcessor
-from . import face_client
+from . import analysis_record, face_client
 from .stream_capture import PRO_FFMPEG_JPEG_Q, PRO_JPEG_OPTIONS
 import os, re
 from datetime import timedelta
@@ -1324,6 +1324,19 @@ def setup(hass, config):
         "get_events",
         get_events,
         supports_response=SupportsResponse.ONLY,
+    )
+
+    async def store_analysis_record(data_call) -> dict:
+        """Write analysis.json (decision + full response) into an evidence directory."""
+        return await analysis_record.async_store_analysis_record(
+            hass, data_call.data.get("directory"), data_call.data.get("record")
+        )
+
+    hass.services.register(
+        DOMAIN,
+        "store_analysis_record",
+        store_analysis_record,
+        supports_response=SupportsResponse.OPTIONAL,
     )
     hass.http.register_view(TimelineEventsView)
     hass.http.register_view(TimelineEventView)

@@ -564,7 +564,7 @@ class TestIdentifyRequest:
             "Authorization": f"Bearer {TOKEN}",
         }
         assert kwargs["allow_redirects"] is False
-        assert kwargs["timeout"].total == 12
+        assert kwargs["timeout"].total == 20
         assert TOKEN not in caplog.text
         assert "lea" not in caplog.text
 

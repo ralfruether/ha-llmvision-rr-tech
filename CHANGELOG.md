@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Added `llmvision.store_analysis_record`: writes `analysis.json` (for example the
+  automation's notification decision and the complete analyzer response) into a
+  directory below `/media/llmvision`, typically the evidence directory next to the
+  clip and snapshots, so analyses can be evaluated later. The directory is confined
+  to `/media/llmvision`, the file name is fixed, the record must be a JSON object (or
+  a JSON string of one) of at most 4 MB, and the file is replaced atomically.
+
+### Changed
+
+- Raised the face service request timeout from 12 to 20 seconds. Long front-door
+  clips (and requests queued behind other cameras) regularly took 12-30 s, and a
+  timeout drops the face result for the whole analysis. In stream mode a follow-up
+  capture of the same camera can now start up to 20 seconds later.
+
 ## 1.7.2.19 - 2026-10-06
 
 ### Added

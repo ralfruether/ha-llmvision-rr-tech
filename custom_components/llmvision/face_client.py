@@ -33,7 +33,7 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 IDENTIFY_PATH = "/v1/identify"
-REQUEST_TIMEOUT = 12
+REQUEST_TIMEOUT = 20
 MAX_CLIP_BYTES = 64 * 1024 * 1024
 MAX_RESPONSE_BYTES = 256 * 1024
 MAX_PERSONS = 10

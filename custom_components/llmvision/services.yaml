@@ -1185,3 +1185,29 @@ get_events:
       default: true
       selector:
         boolean:
+store_analysis_record:
+  name: Store Analysis Record
+  description: >-
+    Writes analysis.json (for example the notification decision and the complete
+    analyzer response) into a directory below /media/llmvision, typically the
+    evidence directory next to the clip and snapshots. Replaces an existing record.
+  fields:
+    directory:
+      name: Directory
+      required: true
+      description: >-
+        Directory below /media/llmvision. Relative paths are placed there; anything
+        resolving outside /media/llmvision is rejected.
+      example: "camera-analysis/einfahrt_20261007T171050_483354"
+      selector:
+        text:
+          multiline: false
+    record:
+      name: Record
+      required: true
+      description: >-
+        JSON object to store, or a JSON string of an object (for example a template
+        ending in `| to_json`). At most 4 MB.
+      example: '{"notification_level": "none"}'
+      selector:
+        object:
