@@ -564,9 +564,18 @@ class TestIdentifyRequest:
             "Authorization": f"Bearer {TOKEN}",
         }
         assert kwargs["allow_redirects"] is False
-        assert kwargs["timeout"].total == 20
+        assert kwargs["timeout"].total == 40  # haustuer; other cameras 20
         assert TOKEN not in caplog.text
         assert "lea" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_other_cameras_use_the_default_timeout(self):
+        session = FakeSession(FakeResponse(body=json.dumps(REAL_RESPONSE).encode()))
+        with patch.object(face_client, "async_get_clientsession", return_value=session):
+            await face_client.async_identify(
+                _hass(), SETTINGS, "einfahrt_hochauflosung", clip_data=b"clip-bytes"
+            )
+        assert session.calls[0][1]["timeout"].total == 20
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("status", [401, 403, 413, 415, 422, 500, 503, 504])

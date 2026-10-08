@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.7.2.21 - 2026-10-08
+
+### Changed
+
+- The face service request for the camera slug `haustuer` now has a 40-second
+  timeout; all other cameras keep 20 seconds. Since appearance re-identification,
+  front-door requests queued behind other cameras took up to 35 s, and the timeout
+  then dropped recognized household members, so the alarm went out without names.
+  In stream mode a follow-up `haustuer` capture can now start up to 40 seconds later.
+
 ## 1.7.2.20 - 2026-10-07
 
 ### Added

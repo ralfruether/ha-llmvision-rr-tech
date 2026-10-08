@@ -56,12 +56,15 @@ data:
   `camera.` or the video file stem (for generic names such as `clip.mp4` the parent
   folder name before the first `_<digit>`).
 - In stream mode the request runs while the camera's capture lock is still held, so
-  a follow-up capture of the same camera can start up to 20 seconds later.
+  a follow-up capture of the same camera can start up to 20 seconds later (40 seconds
+  for `haustuer`, see below).
 - Clips larger than 64 MB are not uploaded (`error:too_large`), and only ISO-BMFF
   video files (mp4/m4v/mov with an `ftyp` header) are ever sent (`error:no_clip`
   otherwise). In snapshot mode the clip is read while the camera lock is still held,
   so a follow-up capture to the same `clip_path` cannot replace it before upload.
-  The request has a total timeout of 20 seconds, follows no redirects and accepts
+  The request has a total timeout of 20 seconds (40 seconds for the camera slug
+  `haustuer`, whose clips take longest when several cameras upload at once;
+  `CAMERA_REQUEST_TIMEOUTS` in `face_client.py`), follows no redirects and accepts
   at most 256 KiB of JSON.
 - `stream_analyzer_pro` transcodes the clip to H.264 capped at 1920 px by default.
   With `record_codec: copy` the face service receives the original camera stream

@@ -34,6 +34,9 @@ _LOGGER = logging.getLogger(__name__)
 
 IDENTIFY_PATH = "/v1/identify"
 REQUEST_TIMEOUT = 20
+# Front door clips take longest when several cameras upload at once (up to 35 s seen
+# since appearance re-identification); its names are worth a later notification.
+CAMERA_REQUEST_TIMEOUTS = {"haustuer": 40}
 MAX_CLIP_BYTES = 64 * 1024 * 1024
 MAX_RESPONSE_BYTES = 256 * 1024
 MAX_PERSONS = 10
@@ -492,6 +495,11 @@ async def _read_limited(response) -> bytes:
     return bytes(body)
 
 
+def request_timeout(camera: str) -> int:
+    """Total request timeout in seconds for a camera slug."""
+    return CAMERA_REQUEST_TIMEOUTS.get(camera, REQUEST_TIMEOUT)
+
+
 async def _async_post_clip(hass, settings: FaceSettings, camera: str, clip: bytes):
     session = async_get_clientsession(hass)
     headers = {
@@ -503,7 +511,7 @@ async def _async_post_clip(hass, settings: FaceSettings, camera: str, clip: byte
         params={"camera": camera},
         data=clip,
         headers=headers,
-        timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT),
+        timeout=aiohttp.ClientTimeout(total=request_timeout(camera)),
         allow_redirects=False,
     ) as response:
         status = int(response.status)
