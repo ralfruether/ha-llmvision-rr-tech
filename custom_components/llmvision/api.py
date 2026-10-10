@@ -1,11 +1,14 @@
 import json
 import logging
+import math
 from datetime import datetime, timedelta
 from typing import Any, Optional
+from aiohttp import web
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.http import HomeAssistantView
 from homeassistant.helpers.json import json_dumps
 from homeassistant.util import dt as dt_util
+from . import analysis_record
 from .calendar import Timeline
 from .const import DOMAIN, CONF_PROVIDER, SIGNAL_TIMELINE_UPDATED
 
@@ -305,3 +308,93 @@ class TimelineEventView(HomeAssistantView):
             return self.json({"event": json.loads(json_dumps(updated))})
         except Exception:
             return self.json({"event_id": event_id, "status": "updated"})
+
+
+def _admin_required(view: HomeAssistantView, request):
+    """403 response unless the authenticated user is an admin, else None."""
+    user = request.get("hass_user")
+    if user is None or not getattr(user, "is_admin", False):
+        return view.json_message("Admin access required", status_code=403)
+    return None
+
+
+def _parse_since(value) -> Optional[float]:
+    """Unix timestamp or ISO datetime (naive = HA time zone); None if invalid."""
+    if value in (None, ""):
+        return 0.0
+    try:
+        number = float(value)
+    except ValueError:
+        pass
+    else:
+        return number if math.isfinite(number) else None
+    parsed = dt_util.parse_datetime(value)
+    if parsed is None:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt_util.get_default_time_zone())
+    return parsed.timestamp()
+
+
+class AnalysisRecordsView(HomeAssistantView):
+    """List stored analysis records (llmvision.store_analysis_record), admin only.
+
+    Query: since (unix or ISO, default 0), limit (1..1000, default 1000).
+    Returns {"records": [{"id", "mtime", "bytes"}], "truncated"}, oldest first.
+    """
+
+    url = "/api/llmvision/analysis_records"
+    name = "api:llmvision:analysis_records"
+    requires_auth = True
+
+    async def get(self, request):
+        if (denied := _admin_required(self, request)) is not None:
+            return denied
+        since = _parse_since(request.query.get("since"))
+        if since is None:
+            return self.json_message("Invalid since", status_code=400)
+        try:
+            limit = int(request.query.get("limit", analysis_record.MAX_LISTED_RECORDS))
+        except ValueError:
+            limit = 0
+        if not 1 <= limit <= analysis_record.MAX_LISTED_RECORDS:
+            return self.json_message("Invalid limit", status_code=400)
+        hass = request.app["hass"]
+        records, truncated = await hass.async_add_executor_job(
+            analysis_record.list_records, since, limit
+        )
+        response = self.json({"records": records, "truncated": truncated})
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+
+class AnalysisRecordView(HomeAssistantView):
+    """Return one stored analysis.json unchanged, admin only."""
+
+    url = "/api/llmvision/analysis_records/{analysis_id}"
+    name = "api:llmvision:analysis_record"
+    requires_auth = True
+
+    async def get(self, request, analysis_id):
+        if (denied := _admin_required(self, request)) is not None:
+            return denied
+        if not analysis_record.is_record_id(analysis_id):
+            return self.json_message("Invalid analysis id", status_code=400)
+        hass = request.app["hass"]
+        try:
+            data = await hass.async_add_executor_job(
+                analysis_record.read_record, analysis_id
+            )
+        except analysis_record.RecordTooLarge:
+            return self.json_message("Record too large", status_code=413)
+        except OSError as err:
+            _LOGGER.warning("Could not read analysis record (%s)", type(err).__name__)
+            return self.json_message("Could not read record", status_code=500)
+        if data is None:
+            return self.json_message("Record not found", status_code=404)
+        return web.Response(
+            body=data,
+            content_type="application/json",
+            charset="utf-8",
+            headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+        )

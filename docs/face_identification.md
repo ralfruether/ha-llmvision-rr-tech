@@ -143,6 +143,19 @@ With `debug_polylines: true`, every annotated frame in `debug` also lists the dr
   replaced atomically. Paths outside `/media/llmvision` are rejected. The record
   contains names and the model's descriptions of people: it is personal data and is
   kept as long as the evidence directory.
+- Home Assistant's media browser serves only images, video and audio, so records
+  below `/media/llmvision/camera-analysis/<analysis id>/` are readable through two
+  read-only REST endpoints, for **admin users only** (others get 403):
+  - `GET /api/llmvision/analysis_records?since=<unix or ISO>&limit=<1..1000>` lists
+    `{"records": [{"id", "mtime", "bytes"}], "truncated"}`, oldest first (`since` is
+    inclusive; ISO times without a zone are in HA's time zone). Page by passing the
+    last `mtime` as the next `since`.
+  - `GET /api/llmvision/analysis_records/<analysis id>` returns the stored
+    `analysis.json` unchanged (404 if there is none, 413 above 4 MB).
+
+  Ids must look like `<camera>_<YYYYMMDD>T<HHMMSS>_<n>`; symlinks are never followed.
+  Any admin credential (including add-ons with Home Assistant API access) can read
+  the records; a dedicated admin user with its own revocable token limits the impact.
 
 ## Privacy and security
 

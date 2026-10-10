@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.7.2.22 - 2026-10-10
+
+### Added
+
+- Added two admin-only, read-only REST endpoints for the records written by
+  `llmvision.store_analysis_record` below `/media/llmvision/camera-analysis`:
+  `GET /api/llmvision/analysis_records` (ids, modification time and size since a
+  time) and `GET /api/llmvision/analysis_records/<analysis id>` (the stored
+  `analysis.json`). Home Assistant's media endpoints serve only images, video and
+  audio, so the records could not be read remotely before; automation traces are
+  limited to the last runs and are lost on an unclean restart. Non-admin users get
+  403, symlinks are never followed, and records above 4 MB are refused (413).
+
 ## 1.7.2.21 - 2026-10-08
 
 ### Changed

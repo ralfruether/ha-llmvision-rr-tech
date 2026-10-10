@@ -9,8 +9,11 @@ file name is fixed; the record must be JSON and at most MAX_RECORD_BYTES.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
+import re
+import stat
 import tempfile
 
 from homeassistant.exceptions import ServiceValidationError
@@ -20,6 +23,11 @@ from .const import DOMAIN
 MEDIA_ROOT = "/media"
 RECORD_FILENAME = "analysis.json"
 MAX_RECORD_BYTES = 4 * 1024 * 1024
+# Read access (admin-only HTTP views): only <MEDIA_ROOT>/llmvision/camera-analysis/<id>/.
+# Ids are camera + timestamp, i.e. presence metadata; records hold identification data.
+RECORDS_SUBDIR = "camera-analysis"
+RECORD_ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}_[0-9]{8}T[0-9]{6}_[0-9]{1,9}")
+MAX_LISTED_RECORDS = 1000
 
 
 def resolve_record_directory(directory) -> str:
@@ -84,3 +92,106 @@ async def async_store_analysis_record(hass, directory, record) -> dict:
             f"could not write {RECORD_FILENAME}: {type(err).__name__}"
         ) from err
     return {"path": target, "bytes": len(data)}
+
+
+# ------------------------------------------------------------------ read access
+
+
+class RecordTooLarge(Exception):
+    """The stored record exceeds MAX_RECORD_BYTES."""
+
+
+def records_root() -> str:
+    return os.path.join(MEDIA_ROOT, DOMAIN, RECORDS_SUBDIR)
+
+
+def is_record_id(value) -> bool:
+    return isinstance(value, str) and RECORD_ID_PATTERN.fullmatch(value) is not None
+
+
+def list_records(since: float, limit: int) -> tuple[list[dict], bool]:
+    """Executor job: records modified at or after `since`, oldest first.
+
+    Only direct subdirectories with a valid id and a regular analysis.json count;
+    symlinks are never followed. Returns (records, truncated).
+    """
+    found = []
+    try:
+        with os.scandir(records_root()) as entries:
+            for entry in entries:
+                if not is_record_id(entry.name) or not entry.is_dir(follow_symlinks=False):
+                    continue
+                try:
+                    info = os.lstat(os.path.join(entry.path, RECORD_FILENAME))
+                except OSError:
+                    continue
+                if stat.S_ISREG(info.st_mode) and info.st_mtime >= since:
+                    found.append(
+                        {"id": entry.name, "mtime": info.st_mtime, "bytes": info.st_size}
+                    )
+    except (FileNotFoundError, NotADirectoryError):
+        return [], False
+    found.sort(key=lambda r: (r["mtime"], r["id"]))
+    return found[:limit], len(found) > limit
+
+
+def read_record(analysis_id: str) -> bytes | None:
+    """Executor job: the bytes of <id>/analysis.json, or None if there is none.
+
+    The id directory and the file are opened relative to the records root without
+    following symlinks (no path is re-resolved between check and read), and the file
+    without blocking, so a FIFO cannot hang the executor.
+    """
+    if not is_record_id(analysis_id):
+        raise ValueError("invalid analysis id")
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        root_fd = os.open(records_root(), os.O_RDONLY | os.O_DIRECTORY)
+    except OSError as err:
+        if _is_missing(err):
+            return None
+        raise
+    try:
+        try:
+            dir_fd = os.open(
+                analysis_id, os.O_RDONLY | os.O_DIRECTORY | nofollow, dir_fd=root_fd
+            )
+        except OSError as err:
+            if _is_missing(err):
+                return None
+            raise
+        try:
+            try:
+                fd = os.open(
+                    RECORD_FILENAME,
+                    os.O_RDONLY | nofollow | getattr(os, "O_NONBLOCK", 0),
+                    dir_fd=dir_fd,
+                )
+            except OSError as err:
+                if _is_missing(err):
+                    return None
+                raise
+            try:
+                info = os.fstat(fd)
+            except OSError:
+                os.close(fd)
+                raise
+            if not stat.S_ISREG(info.st_mode):
+                os.close(fd)
+                return None
+            with os.fdopen(fd, "rb") as handle:
+                if info.st_size > MAX_RECORD_BYTES:
+                    raise RecordTooLarge
+                data = handle.read(MAX_RECORD_BYTES + 1)
+            if len(data) > MAX_RECORD_BYTES:
+                raise RecordTooLarge
+            return data
+        finally:
+            os.close(dir_fd)
+    finally:
+        os.close(root_fd)
+
+
+def _is_missing(err: OSError) -> bool:
+    """Missing, not a directory, or a symlink where none may be (O_NOFOLLOW)."""
+    return err.errno in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP)
