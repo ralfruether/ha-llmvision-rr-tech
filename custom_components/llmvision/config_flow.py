@@ -70,8 +70,9 @@ from .const import (
     VERSION_AZURE,
     CONF_FACE_SERVICE_URL,
     CONF_FACE_SERVICE_TOKEN,
+    CONF_FACE_SERVICE_CERT_FINGERPRINT,
 )
-from .face_client import is_valid_face_service_token, normalize_face_service_url
+from .face_client import validate_face_settings
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -1481,6 +1482,9 @@ class llmvisionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                             vol.Optional(CONF_FACE_SERVICE_TOKEN): selector(
                                 {"text": {"type": "password"}}
                             ),
+                            vol.Optional(CONF_FACE_SERVICE_CERT_FINGERPRINT): selector(
+                                {"text": {}}
+                            ),
                         }
                     ),
                     {"collapsed": True},
@@ -1533,6 +1537,9 @@ class llmvisionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 CONF_FACE_SERVICE_TOKEN: self.init_info.get(
                     CONF_FACE_SERVICE_TOKEN, ""
                 ),
+                CONF_FACE_SERVICE_CERT_FINGERPRINT: self.init_info.get(
+                    CONF_FACE_SERVICE_CERT_FINGERPRINT, ""
+                ),
             },
         }
         data_schema = self.add_suggested_values_to_schema(data_schema, suggested)
@@ -1562,19 +1569,19 @@ class llmvisionConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             # Missing keys mean "cleared" so reconfigure can disable the service
             user_input.setdefault(CONF_FACE_SERVICE_URL, "")
             user_input.setdefault(CONF_FACE_SERVICE_TOKEN, "")
+            user_input.setdefault(CONF_FACE_SERVICE_CERT_FINGERPRINT, "")
             try:
-                user_input[CONF_FACE_SERVICE_URL] = normalize_face_service_url(
-                    user_input[CONF_FACE_SERVICE_URL]
+                (
+                    user_input[CONF_FACE_SERVICE_URL],
+                    user_input[CONF_FACE_SERVICE_TOKEN],
+                    user_input[CONF_FACE_SERVICE_CERT_FINGERPRINT],
+                ) = validate_face_settings(
+                    user_input[CONF_FACE_SERVICE_URL],
+                    user_input[CONF_FACE_SERVICE_TOKEN],
+                    user_input[CONF_FACE_SERVICE_CERT_FINGERPRINT],
                 )
-            except ValueError:
-                errors = {"base": "invalid_face_service_url"}
-            else:
-                token = str(user_input[CONF_FACE_SERVICE_TOKEN] or "").strip()
-                user_input[CONF_FACE_SERVICE_TOKEN] = token
-                if user_input[CONF_FACE_SERVICE_URL] and not is_valid_face_service_token(
-                    token
-                ):
-                    errors = {"base": "invalid_face_service_token"}
+            except ValueError as err:
+                errors = {"base": str(err)}
 
             if errors:
                 return self.async_show_form(

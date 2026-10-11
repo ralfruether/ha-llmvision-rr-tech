@@ -53,6 +53,7 @@ CONF_MEMORY_STRINGS = "memory_strings"
 # Optional local face identification service (Settings entry)
 CONF_FACE_SERVICE_URL = "face_service_url"
 CONF_FACE_SERVICE_TOKEN = "face_service_token"
+CONF_FACE_SERVICE_CERT_FINGERPRINT = "face_service_cert_fingerprint"
 
 # Dispatcher signals
 SIGNAL_TIMELINE_UPDATED = f"{DOMAIN}_timeline_updated"

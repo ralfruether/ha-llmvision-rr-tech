@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- The face service is reached over HTTPS only. A new optional setting **Face service
+  certificate fingerprint (SHA-256)** pins the service's own certificate; it is
+  required for private/loopback IP addresses and `.local`/`.lan` hosts, which cannot
+  have a publicly trusted certificate. Plain `http://` URLs are no longer accepted.
+  Existing entries with an `http://` URL (or a LAN URL without fingerprint) are not
+  silently disabled: identification reports `face_service: error:misconfigured` until
+  the URL and fingerprint are updated under **LLM Vision Settings → Reconfigure**.
+- Face service timeouts raised to 30 seconds (45 seconds for the camera slug
+  `haustuer`) for the larger person detector (YOLO26l; YOLO26s for the front door).
+  The timeout is sent as `deadline_s`, so the service drops requests that are still
+  queued when Home Assistant has given up. In stream mode a follow-up capture of the
+  same camera can now start up to 30 (45) seconds later.
+
+### Added
+
+- New `face_service` error reason `tls` for a certificate that does not match the
+  pinned fingerprint or a failed TLS handshake.
+
 ## 1.7.2.22 - 2026-10-10
 
 ### Added

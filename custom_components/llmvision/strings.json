@@ -452,11 +452,13 @@
                         "description": "Optionally send recorded clips to a local face identification service so video_analyzer_pro and stream_analyzer_pro can name known household members (service option identify_persons). This is biometric identification: identified names are sent to your AI provider. Never use identities to drive locks, alarms or other security actions.",
                         "data": {
                             "face_service_url": "Face service URL",
-                            "face_service_token": "Face service token"
+                            "face_service_token": "Face service token",
+                            "face_service_cert_fingerprint": "Face service certificate fingerprint (SHA-256)"
                         },
                         "data_description": {
-                            "face_service_url": "Base URL of the face service, e.g. http://192.168.1.10:8770. Plain http is only allowed for private IP addresses and .local/.lan hosts. Leave empty to disable.",
-                            "face_service_token": "Bearer token of the face service (16-512 characters). Required when a URL is set."
+                            "face_service_url": "Base URL of the face service, e.g. https://192.168.1.10:8770. Only https is accepted. Leave empty to disable.",
+                            "face_service_token": "Bearer token of the face service (16-512 characters). Required when a URL is set.",
+                            "face_service_cert_fingerprint": "SHA-256 fingerprint of the face service's certificate (python -m face_service.service tls fingerprint). Required for private IP addresses and .local/.lan hosts; Home Assistant then accepts only this certificate. Update it whenever the certificate is renewed."
                         }
                     }
                 }
@@ -469,8 +471,10 @@
             "memory_not_supported": "This provider does not support memory",
             "invalid_image_path": "One or more image paths are invalid",
             "mismatched_lengths": "The number of image paths and descriptions must match",
-            "invalid_face_service_url": "Invalid face service URL. Use http(s)://host[:port] without credentials, query or fragment; plain http only for private IP addresses or .local/.lan hosts.",
-            "invalid_face_service_token": "Invalid face service token. It is required when a URL is set and must be 16-512 characters (letters, digits and ._~+/=-)."
+            "invalid_face_service_url": "Invalid face service URL. Use https://host[:port] without credentials, query or fragment.",
+            "invalid_face_service_token": "Invalid face service token. It is required when a URL is set and must be 16-512 characters (letters, digits and ._~+/=-).",
+            "invalid_face_service_cert_fingerprint": "Invalid certificate fingerprint. Enter the SHA-256 fingerprint as 64 hexadecimal characters (colons allowed).",
+            "face_service_cert_fingerprint_required": "A certificate fingerprint is required for a face service on a private IP address or a .local/.lan host."
         },
         "abort": {
             "unknown_provider": "Unknown provider",

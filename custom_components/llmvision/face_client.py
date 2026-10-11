@@ -16,14 +16,17 @@ import logging
 import math
 import os
 import re
+import ssl
 import time
 from dataclasses import dataclass, field
+from functools import lru_cache
 from urllib.parse import urlsplit
 
 import aiohttp
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .const import (
+    CONF_FACE_SERVICE_CERT_FINGERPRINT,
     CONF_FACE_SERVICE_TOKEN,
     CONF_FACE_SERVICE_URL,
     CONF_PROVIDER,
@@ -33,10 +36,12 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 IDENTIFY_PATH = "/v1/identify"
-REQUEST_TIMEOUT = 20
-# Front door clips take longest when several cameras upload at once (up to 35 s seen
-# since appearance re-identification); its names are worth a later notification.
-CAMERA_REQUEST_TIMEOUTS = {"haustuer": 40}
+# Total wait for the face service per clip. The service runs YOLO26l plus appearance
+# re-identification (budget 18 s) for most cameras; the front door's long clips use YOLO26s
+# (budget 30 s, up to 41 s measured), and its names are worth a later notification. The
+# service drops requests still queued when this deadline (sent as deadline_s) has passed.
+REQUEST_TIMEOUT = 30
+CAMERA_REQUEST_TIMEOUTS = {"haustuer": 45}
 MAX_CLIP_BYTES = 64 * 1024 * 1024
 MAX_RESPONSE_BYTES = 256 * 1024
 MAX_PERSONS = 10
@@ -50,10 +55,11 @@ SCORE_DECIMALS = 3
 
 NAME_PATTERN = re.compile(r"[a-z][a-z .'-]{0,39}")
 TOKEN_PATTERN = re.compile(r"[A-Za-z0-9._~+/=-]{16,512}")
+FINGERPRINT_PATTERN = re.compile(r"[0-9a-f]{64}")
 _SLUG_INVALID = re.compile(r"[^A-Za-z0-9_.-]")
 _SLUG_MAX = 64
 _GENERIC_STEMS = {"clip", "video", "recording"}
-_PLAIN_HTTP_SUFFIXES = (".local", ".lan")
+_LAN_HOST_SUFFIXES = (".local", ".lan")
 
 STATUS_OK = "ok"
 STATUS_DISABLED = "disabled"
@@ -63,6 +69,13 @@ REASON_REDIRECT = "redirect"
 REASON_INVALID_RESPONSE = "invalid_response"
 REASON_TOO_LARGE = "too_large"
 REASON_NO_CLIP = "no_clip"
+REASON_TLS = "tls"
+REASON_MISCONFIGURED = "misconfigured"
+
+ERROR_INVALID_URL = "invalid_face_service_url"
+ERROR_INVALID_TOKEN = "invalid_face_service_token"
+ERROR_INVALID_FINGERPRINT = "invalid_face_service_cert_fingerprint"
+ERROR_FINGERPRINT_REQUIRED = "face_service_cert_fingerprint_required"
 
 
 class FaceServiceError(Exception):
@@ -77,6 +90,21 @@ class FaceServiceError(Exception):
 class FaceSettings:
     url: str
     token: str = field(repr=False)
+    # SHA-256 of the service's certificate (64 lowercase hex); "" = default CA checks.
+    fingerprint: str = ""
+    # Fixed reason when the stored settings are unusable; requests then fail visibly.
+    error: str | None = None
+
+    @property
+    def ssl(self):
+        """aiohttp `ssl` argument: the pinned certificate, else default verification."""
+        return _pinned_certificate(self.fingerprint) if self.fingerprint else True
+
+
+@lru_cache(maxsize=4)
+def _pinned_certificate(fingerprint: str) -> aiohttp.Fingerprint:
+    # One object per pin, so pooled connections keep being reused.
+    return aiohttp.Fingerprint(bytes.fromhex(fingerprint))
 
 
 @dataclass(frozen=True)
@@ -135,9 +163,9 @@ class FaceResult:
 def normalize_face_service_url(value) -> str:
     """Return the normalized service URL, "" when unset; raise ValueError if invalid.
 
-    Plain http is only accepted for private/loopback IP addresses and .local/.lan
-    hosts; https is accepted for any host. Credentials, query and fragment are
-    rejected so the URL cannot smuggle data or change the request target.
+    Only https is accepted: the request carries the bearer token and a camera clip.
+    Credentials, query and fragment are rejected so the URL cannot smuggle data or
+    change the request target.
     """
     url = str(value or "").strip()
     while url.endswith("/"):
@@ -145,23 +173,45 @@ def normalize_face_service_url(value) -> str:
     if not url:
         return ""
     if any(ch.isspace() for ch in url) or "?" in url or "#" in url:
-        raise ValueError("invalid_face_service_url")
-    parts = urlsplit(url)
-    scheme = parts.scheme.lower()
-    if scheme not in ("http", "https"):
-        raise ValueError("invalid_face_service_url")
+        raise ValueError(ERROR_INVALID_URL)
+    try:
+        parts = urlsplit(url)
+    except ValueError as err:  # e.g. an unclosed IPv6 bracket
+        raise ValueError(ERROR_INVALID_URL) from err
+    if parts.scheme.lower() != "https":
+        raise ValueError(ERROR_INVALID_URL)
     if "@" in parts.netloc or parts.query or parts.fragment:
-        raise ValueError("invalid_face_service_url")
+        raise ValueError(ERROR_INVALID_URL)
     host = (parts.hostname or "").lower()
     if not host:
-        raise ValueError("invalid_face_service_url")
+        raise ValueError(ERROR_INVALID_URL)
     try:
         parts.port
     except ValueError as err:
-        raise ValueError("invalid_face_service_url") from err
-    if scheme == "http" and not _is_lan_host(host):
-        raise ValueError("invalid_face_service_url")
+        raise ValueError(ERROR_INVALID_URL) from err
+    try:
+        unspecified = ipaddress.ip_address(host).is_unspecified
+    except ValueError:
+        unspecified = False
+    if unspecified:
+        raise ValueError(ERROR_INVALID_URL)
     return url
+
+
+def normalize_cert_fingerprint(value) -> str:
+    """SHA-256 certificate fingerprint as 64 lowercase hex characters, "" when unset.
+
+    Accepts the usual notations (colons, spaces, either case); raises ValueError otherwise.
+    """
+    text = re.sub(r"[\s:]", "", str(value or "")).lower()
+    if text and not FINGERPRINT_PATTERN.fullmatch(text):
+        raise ValueError(ERROR_INVALID_FINGERPRINT)
+    return text
+
+
+def requires_pinned_certificate(url: str) -> bool:
+    """LAN hosts cannot have a publicly trusted certificate: pin the service's own."""
+    return _is_lan_host((urlsplit(url).hostname or "").lower())
 
 
 def _is_lan_host(host: str) -> bool:
@@ -170,11 +220,25 @@ def _is_lan_host(host: str) -> bool:
     except ValueError:
         return any(
             host.endswith(suffix) and len(host) > len(suffix)
-            for suffix in _PLAIN_HTTP_SUFFIXES
+            for suffix in _LAN_HOST_SUFFIXES
         )
-    if address.is_unspecified or address.is_multicast:
-        return False
-    return address.is_private or address.is_loopback
+    return address.is_private or address.is_loopback or address.is_link_local
+
+
+def validate_face_settings(url, token, fingerprint) -> tuple[str, str, str]:
+    """Normalized (url, token, fingerprint); raises ValueError(<config flow error key>).
+
+    An empty URL disables the service (token and fingerprint are still normalized).
+    """
+    url = normalize_face_service_url(url)
+    token = str(token or "").strip()
+    fingerprint = normalize_cert_fingerprint(fingerprint)
+    if url:
+        if not is_valid_face_service_token(token):
+            raise ValueError(ERROR_INVALID_TOKEN)
+        if not fingerprint and requires_pinned_certificate(url):
+            raise ValueError(ERROR_FINGERPRINT_REQUIRED)
+    return url, token, fingerprint
 
 
 def is_valid_face_service_token(value) -> bool:
@@ -182,19 +246,27 @@ def is_valid_face_service_token(value) -> bool:
 
 
 def get_face_settings(hass) -> FaceSettings | None:
-    """Read the face service settings from the Settings entry; None = disabled."""
+    """Read the face service settings from the Settings entry; None = disabled.
+
+    Stored settings that are no longer valid (e.g. a plain http URL from an older
+    version, or a missing certificate pin) give settings with error "misconfigured",
+    so identification fails visibly instead of being silently switched off.
+    """
     for entry in hass.config_entries.async_entries(DOMAIN):
         data = entry.data or {}
         if data.get(CONF_PROVIDER) != "Settings":
             continue
+        if not str(data.get(CONF_FACE_SERVICE_URL) or "").strip():
+            return None
         try:
-            url = normalize_face_service_url(data.get(CONF_FACE_SERVICE_URL))
+            url, token, fingerprint = validate_face_settings(
+                data.get(CONF_FACE_SERVICE_URL),
+                data.get(CONF_FACE_SERVICE_TOKEN),
+                data.get(CONF_FACE_SERVICE_CERT_FINGERPRINT),
+            )
         except ValueError:
-            return None
-        token = data.get(CONF_FACE_SERVICE_TOKEN)
-        if not url or not is_valid_face_service_token(token):
-            return None
-        return FaceSettings(url=url, token=token)
+            return FaceSettings(url="", token="", error=REASON_MISCONFIGURED)
+        return FaceSettings(url=url, token=token, fingerprint=fingerprint)
     return None
 
 
@@ -506,13 +578,15 @@ async def _async_post_clip(hass, settings: FaceSettings, camera: str, clip: byte
         "Content-Type": "video/mp4",
         "Authorization": f"Bearer {settings.token}",
     }
+    timeout = request_timeout(camera)
     async with session.post(
         f"{settings.url}{IDENTIFY_PATH}",
-        params={"camera": camera},
+        params={"camera": camera, "deadline_s": str(timeout)},
         data=clip,
         headers=headers,
-        timeout=aiohttp.ClientTimeout(total=request_timeout(camera)),
+        timeout=aiohttp.ClientTimeout(total=timeout),
         allow_redirects=False,
+        ssl=settings.ssl,
     ) as response:
         status = int(response.status)
         if 300 <= status < 400:
@@ -548,6 +622,8 @@ async def async_identify(
 ) -> FaceResult:
     """Identify known persons in a clip. Never raises except on cancellation."""
     started = time.monotonic()
+    if settings.error:
+        return error_result(camera, settings.error)
     try:
         if clip_data is None:
             clip_data = await async_load_clip(hass, clip_path)
@@ -560,6 +636,8 @@ async def async_identify(
         reason = err.reason
     except (asyncio.TimeoutError, TimeoutError):
         reason = REASON_TIMEOUT
+    except (aiohttp.ServerFingerprintMismatch, aiohttp.ClientSSLError, ssl.SSLError):
+        reason = REASON_TLS
     except (aiohttp.ClientError, OSError):
         reason = REASON_CONNECTION
     except Exception:  # noqa: BLE001 - the face service must never fail the analysis

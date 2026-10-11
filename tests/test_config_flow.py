@@ -18,6 +18,7 @@ from custom_components.llmvision.const import (
     CONF_CONTEXT_WINDOW,
     CONF_CUSTOM_OPENAI_ENDPOINT,
     CONF_DEFAULT_MODEL,
+    CONF_FACE_SERVICE_CERT_FINGERPRINT,
     CONF_FACE_SERVICE_TOKEN,
     CONF_FACE_SERVICE_URL,
     CONF_FALLBACK_PROVIDER,
@@ -338,6 +339,8 @@ class TestSettingsStep:
 
 
 FACE_TOKEN = "face-service-token-0123456789"
+FACE_PIN = "ab" * 32
+FACE_PIN_COLONS = ":".join(["AB"] * 32)
 
 
 def _settings_input(face_section=None):
@@ -366,14 +369,16 @@ class TestFaceServiceSettings:
         result = await flow.async_step_settings(
             _settings_input(
                 {
-                    CONF_FACE_SERVICE_URL: " http://192.168.9.230:8770/ ",
+                    CONF_FACE_SERVICE_URL: " https://192.168.9.230:8770/ ",
                     CONF_FACE_SERVICE_TOKEN: FACE_TOKEN,
+                    CONF_FACE_SERVICE_CERT_FINGERPRINT: f" {FACE_PIN_COLONS} ",
                 }
             )
         )
         assert result["type"] == "create_entry"
-        assert result["data"][CONF_FACE_SERVICE_URL] == "http://192.168.9.230:8770"
+        assert result["data"][CONF_FACE_SERVICE_URL] == "https://192.168.9.230:8770"
         assert result["data"][CONF_FACE_SERVICE_TOKEN] == FACE_TOKEN
+        assert result["data"][CONF_FACE_SERVICE_CERT_FINGERPRINT] == FACE_PIN
 
     @pytest.mark.asyncio
     async def test_defaults_to_disabled(self, build_flow):
@@ -381,14 +386,16 @@ class TestFaceServiceSettings:
         result = await flow.async_step_settings(_settings_input())
         assert result["data"][CONF_FACE_SERVICE_URL] == ""
         assert result["data"][CONF_FACE_SERVICE_TOKEN] == ""
+        assert result["data"][CONF_FACE_SERVICE_CERT_FINGERPRINT] == ""
 
     @pytest.mark.asyncio
     async def test_reconfigure_clears_fields(self, build_flow):
         existing = Mock(
             data={
                 CONF_PROVIDER: "Settings",
-                CONF_FACE_SERVICE_URL: "http://192.168.9.230:8770",
+                CONF_FACE_SERVICE_URL: "https://192.168.9.230:8770",
                 CONF_FACE_SERVICE_TOKEN: FACE_TOKEN,
+                CONF_FACE_SERVICE_CERT_FINGERPRINT: FACE_PIN,
             }
         )
         flow = build_flow(source=config_entries.SOURCE_RECONFIGURE)
@@ -398,14 +405,16 @@ class TestFaceServiceSettings:
         assert result["type"] == "update"
         assert result["data_updates"][CONF_FACE_SERVICE_URL] == ""
         assert result["data_updates"][CONF_FACE_SERVICE_TOKEN] == ""
+        assert result["data_updates"][CONF_FACE_SERVICE_CERT_FINGERPRINT] == ""
 
     @pytest.mark.asyncio
     async def test_reconfigure_suggests_existing_values(self, build_flow):
         existing = Mock(
             data={
                 CONF_PROVIDER: "Settings",
-                CONF_FACE_SERVICE_URL: "http://192.168.9.230:8770",
+                CONF_FACE_SERVICE_URL: "https://192.168.9.230:8770",
                 CONF_FACE_SERVICE_TOKEN: FACE_TOKEN,
+                CONF_FACE_SERVICE_CERT_FINGERPRINT: FACE_PIN,
             }
         )
         flow = build_flow(source=config_entries.SOURCE_RECONFIGURE)
@@ -413,8 +422,9 @@ class TestFaceServiceSettings:
         await flow.async_step_settings()
         suggested = flow.add_suggested_values_to_schema.call_args.args[1]
         assert suggested["face_service_section"] == {
-            CONF_FACE_SERVICE_URL: "http://192.168.9.230:8770",
+            CONF_FACE_SERVICE_URL: "https://192.168.9.230:8770",
             CONF_FACE_SERVICE_TOKEN: FACE_TOKEN,
+            CONF_FACE_SERVICE_CERT_FINGERPRINT: FACE_PIN,
         }
         schema_keys = [str(key) for key in flow.async_show_form.call_args.kwargs[
             "data_schema"
@@ -432,18 +442,22 @@ class TestFaceServiceSettings:
         assert suggested["face_service_section"] == {
             CONF_FACE_SERVICE_URL: "",
             CONF_FACE_SERVICE_TOKEN: "",
+            CONF_FACE_SERVICE_CERT_FINGERPRINT: "",
         }
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "url",
         [
+            "http://192.168.9.230:8770",
+            "http://mac-mini.local:8770",
             "http://8.8.8.8:8770",
             "http://face.example.com",
             "ftp://192.168.9.230",
             "http://user:pw@192.168.9.230:8770",
             "http://192.168.9.230:8770/?a=1",
             "http://192.168.9.230:8770#x",
+            "https://[fd00::1",
             "not a url",
         ],
     )
@@ -476,12 +490,58 @@ class TestFaceServiceSettings:
         for name in ("strings.json", "translations/en.json", "translations/de.json"):
             data = json.loads((base / name).read_text(encoding="utf-8"))
             sections = data["config"]["step"]["settings"]["sections"]
-            assert set(sections["face_service_section"]["data"]) == {
-                CONF_FACE_SERVICE_URL,
-                CONF_FACE_SERVICE_TOKEN,
-            }
-            assert "invalid_face_service_url" in data["config"]["error"]
-            assert "invalid_face_service_token" in data["config"]["error"]
+            face = sections["face_service_section"]
+            fields = {CONF_FACE_SERVICE_URL, CONF_FACE_SERVICE_TOKEN, CONF_FACE_SERVICE_CERT_FINGERPRINT}
+            assert set(face["data"]) == fields
+            assert set(face["data_description"]) == fields
+            for key in (
+                "invalid_face_service_url",
+                "invalid_face_service_token",
+                "invalid_face_service_cert_fingerprint",
+                "face_service_cert_fingerprint_required",
+            ):
+                assert key in data["config"]["error"], (name, key)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "pin", ["ab" * 31, "ab" * 33, "zz" * 32, "ab" * 31 + "a"]
+    )
+    async def test_rejects_invalid_fingerprint(self, build_flow, pin):
+        flow = build_flow(init_info={CONF_PROVIDER: "Settings"})
+        result = await flow.async_step_settings(
+            _settings_input(
+                {
+                    CONF_FACE_SERVICE_URL: "https://192.168.9.230:8770",
+                    CONF_FACE_SERVICE_TOKEN: FACE_TOKEN,
+                    CONF_FACE_SERVICE_CERT_FINGERPRINT: pin,
+                }
+            )
+        )
+        assert result["type"] == "form"
+        assert result["errors"] == {"base": "invalid_face_service_cert_fingerprint"}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "url", ["https://192.168.9.230:8770", "https://mac-mini.local:8770"]
+    )
+    async def test_lan_service_requires_fingerprint(self, build_flow, url):
+        flow = build_flow(init_info={CONF_PROVIDER: "Settings"})
+        result = await flow.async_step_settings(
+            _settings_input({CONF_FACE_SERVICE_URL: url, CONF_FACE_SERVICE_TOKEN: FACE_TOKEN})
+        )
+        assert result["type"] == "form"
+        assert result["errors"] == {"base": "face_service_cert_fingerprint_required"}
+
+    @pytest.mark.asyncio
+    async def test_public_https_service_needs_no_fingerprint(self, build_flow):
+        flow = build_flow(init_info={CONF_PROVIDER: "Settings"})
+        result = await flow.async_step_settings(
+            _settings_input(
+                {CONF_FACE_SERVICE_URL: "https://face.example.com", CONF_FACE_SERVICE_TOKEN: FACE_TOKEN}
+            )
+        )
+        assert result["type"] == "create_entry"
+        assert result["data"][CONF_FACE_SERVICE_CERT_FINGERPRINT] == ""
 
 
 class TestProviderSteps:

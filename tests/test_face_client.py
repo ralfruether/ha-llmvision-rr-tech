@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import math
+import ssl
 
 import aiohttp
 import pytest
@@ -10,6 +11,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from custom_components.llmvision import face_client
 from custom_components.llmvision.const import (
+    CONF_FACE_SERVICE_CERT_FINGERPRINT,
     CONF_FACE_SERVICE_TOKEN,
     CONF_FACE_SERVICE_URL,
     CONF_PROVIDER,
@@ -23,7 +25,8 @@ from custom_components.llmvision.face_client import (
 )
 
 TOKEN = "s3cret-Token_value.0123456789"
-SETTINGS = FaceSettings(url="http://192.168.9.230:8770", token=TOKEN)
+PIN = "ab" * 32
+SETTINGS = FaceSettings(url="https://192.168.9.230:8770", token=TOKEN, fingerprint=PIN)
 MP4 = b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom" + b"mdat-bytes"
 
 REAL_RESPONSE = {
@@ -332,13 +335,12 @@ class TestSettings:
     @pytest.mark.parametrize(
         "url,expected",
         [
-            ("http://192.168.9.230:8770", "http://192.168.9.230:8770"),
-            (" http://192.168.9.230:8770/ ", "http://192.168.9.230:8770"),
-            ("http://10.0.0.5/face/", "http://10.0.0.5/face"),
-            ("http://127.0.0.1:8770", "http://127.0.0.1:8770"),
-            ("http://[fd00::1]:8770", "http://[fd00::1]:8770"),
-            ("http://mac-mini.local:8770", "http://mac-mini.local:8770"),
-            ("http://facebox.lan", "http://facebox.lan"),
+            ("https://192.168.9.230:8770", "https://192.168.9.230:8770"),
+            (" https://192.168.9.230:8770/ ", "https://192.168.9.230:8770"),
+            ("https://10.0.0.5/face/", "https://10.0.0.5/face"),
+            ("https://127.0.0.1:8770", "https://127.0.0.1:8770"),
+            ("https://[fd00::1]:8770", "https://[fd00::1]:8770"),
+            ("https://mac-mini.local:8770", "https://mac-mini.local:8770"),
             ("https://face.example.com", "https://face.example.com"),
             ("HTTPS://8.8.8.8:443", "HTTPS://8.8.8.8:443"),
             ("", ""),
@@ -352,11 +354,13 @@ class TestSettings:
     @pytest.mark.parametrize(
         "url",
         [
+            "http://192.168.9.230:8770",
+            "http://127.0.0.1:8770",
+            "http://mac-mini.local:8770",
             "http://8.8.8.8:8770",
             "http://face.example.com",
-            "http://local",
-            "http://.lan",
-            "http://0.0.0.0:8770",
+            "https://0.0.0.0:8770",
+            "https://[::]:8770",
             "ftp://192.168.1.2",
             "192.168.1.2:8770",
             "http://user:pw@192.168.1.2",
@@ -408,33 +412,81 @@ class TestSettings:
         hass = self._hass(
             {
                 CONF_PROVIDER: "Settings",
-                CONF_FACE_SERVICE_URL: "http://192.168.9.230:8770/",
+                CONF_FACE_SERVICE_URL: "https://192.168.9.230:8770/",
                 CONF_FACE_SERVICE_TOKEN: TOKEN,
+                CONF_FACE_SERVICE_CERT_FINGERPRINT: ":".join(["AB"] * 32),
             }
         )
         settings = face_client.get_face_settings(hass)
-        assert settings.url == "http://192.168.9.230:8770"
+        assert settings.url == "https://192.168.9.230:8770"
         assert settings.token == TOKEN
+        assert settings.fingerprint == PIN and settings.error is None
         assert TOKEN not in repr(settings)
 
+    def test_empty_url_disables(self):
+        hass = self._hass(
+            {CONF_PROVIDER: "Settings", CONF_FACE_SERVICE_URL: " ", CONF_FACE_SERVICE_TOKEN: TOKEN}
+        )
+        assert face_client.get_face_settings(hass) is None
+
     @pytest.mark.parametrize(
-        "url,token",
+        "url,token,pin",
         [
-            ("", TOKEN),
-            ("http://192.168.9.230:8770", ""),
-            ("http://8.8.8.8", TOKEN),
-            ("http://192.168.9.230:8770", "short"),
+            ("http://192.168.9.230:8770", TOKEN, ""),  # entry from before HTTPS
+            ("http://192.168.9.230:8770", TOKEN, PIN),
+            ("https://192.168.9.230:8770", TOKEN, ""),  # LAN host without pin
+            ("https://192.168.9.230:8770", "", PIN),
+            ("https://192.168.9.230:8770", "short", PIN),
+            ("https://192.168.9.230:8770", TOKEN, "ab" * 31),
+            ("http://8.8.8.8", TOKEN, PIN),
         ],
     )
-    def test_incomplete_or_invalid_entry_disabled(self, url, token):
+    def test_unusable_entry_is_misconfigured_not_disabled(self, url, token, pin):
         hass = self._hass(
             {
                 CONF_PROVIDER: "Settings",
                 CONF_FACE_SERVICE_URL: url,
                 CONF_FACE_SERVICE_TOKEN: token,
+                CONF_FACE_SERVICE_CERT_FINGERPRINT: pin,
             }
         )
-        assert face_client.get_face_settings(hass) is None
+        settings = face_client.get_face_settings(hass)
+        assert settings is not None and settings.error == "misconfigured"
+        assert settings.url == "" and settings.token == ""
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ("", ""),
+            (None, ""),
+            (PIN, PIN),
+            (PIN.upper(), PIN),
+            (":".join(["AB"] * 32), PIN),
+            (" ab " * 32, PIN),
+        ],
+    )
+    def test_fingerprint_normalized(self, value, expected):
+        assert face_client.normalize_cert_fingerprint(value) == expected
+
+    @pytest.mark.parametrize("value", ["ab" * 31, "ab" * 33, "g" * 64, "ab" * 31 + "a", "sha256:" + PIN])
+    def test_invalid_fingerprint(self, value):
+        with pytest.raises(ValueError, match="invalid_face_service_cert_fingerprint"):
+            face_client.normalize_cert_fingerprint(value)
+
+    @pytest.mark.parametrize(
+        "url,required",
+        [
+            ("https://192.168.9.230:8770", True),
+            ("https://127.0.0.1:8770", True),
+            ("https://[fd00::1]:8770", True),
+            ("https://mac-mini.local:8770", True),
+            ("https://facebox.lan", True),
+            ("https://face.example.com", False),
+            ("https://8.8.8.8", False),
+        ],
+    )
+    def test_lan_hosts_require_a_pin(self, url, required):
+        assert face_client.requires_pinned_certificate(url) is required
 
     def test_no_settings_entry(self):
         hass = self._hass({CONF_PROVIDER: "OpenAI"})
@@ -556,15 +608,17 @@ class TestIdentifyRequest:
         assert [p.name for p in result.persons] == ["lea", "anke"]
         assert result.has_unknown is True
         url, kwargs = session.calls[0]
-        assert url == "http://192.168.9.230:8770/v1/identify"
-        assert kwargs["params"] == {"camera": "haustuer"}
+        assert url == "https://192.168.9.230:8770/v1/identify"
+        assert kwargs["params"] == {"camera": "haustuer", "deadline_s": "45"}
+        assert isinstance(kwargs["ssl"], aiohttp.Fingerprint)
+        assert kwargs["ssl"].fingerprint == bytes.fromhex(PIN)
         assert kwargs["data"] == b"clip-bytes"
         assert kwargs["headers"] == {
             "Content-Type": "video/mp4",
             "Authorization": f"Bearer {TOKEN}",
         }
         assert kwargs["allow_redirects"] is False
-        assert kwargs["timeout"].total == 40  # haustuer; other cameras 20
+        assert kwargs["timeout"].total == 45  # haustuer; other cameras 30
         assert TOKEN not in caplog.text
         assert "lea" not in caplog.text
 
@@ -575,7 +629,32 @@ class TestIdentifyRequest:
             await face_client.async_identify(
                 _hass(), SETTINGS, "einfahrt_hochauflosung", clip_data=b"clip-bytes"
             )
-        assert session.calls[0][1]["timeout"].total == 20
+        assert session.calls[0][1]["timeout"].total == 30
+        assert session.calls[0][1]["params"]["deadline_s"] == "30"
+
+    @pytest.mark.asyncio
+    async def test_pin_object_is_reused_and_unpinned_uses_default_checks(self):
+        session = FakeSession(FakeResponse(body=json.dumps(REAL_RESPONSE).encode()))
+        public = FaceSettings(url="https://face.example.com", token=TOKEN)
+        with patch.object(face_client, "async_get_clientsession", return_value=session):
+            for settings in (SETTINGS, SETTINGS, public):
+                await face_client.async_identify(
+                    _hass(), settings, "garten", clip_data=b"clip-bytes"
+                )
+        first, second, unpinned = (call[1]["ssl"] for call in session.calls)
+        assert first is second  # keeps pooled connections reusable
+        assert unpinned is True
+
+    @pytest.mark.asyncio
+    async def test_misconfigured_settings_fail_visibly_without_a_request(self, caplog):
+        session = FakeSession(FakeResponse(body=json.dumps(REAL_RESPONSE).encode()))
+        broken = FaceSettings(url="", token="", error="misconfigured")
+        with patch.object(face_client, "async_get_clientsession", return_value=session):
+            result = await face_client.async_identify(
+                _hass(), broken, "haustuer", clip_path="/missing.mp4"
+            )
+        assert result.status == "error:misconfigured" and session.calls == []
+        assert "error:misconfigured" in caplog.text
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("status", [401, 403, 413, 415, 422, 500, 503, 504])
@@ -606,6 +685,11 @@ class TestIdentifyRequest:
             (aiohttp.ClientConnectionError(f"Bearer {TOKEN}"), "error:connection"),
             (aiohttp.ClientPayloadError("x"), "error:connection"),
             (ConnectionRefusedError(), "error:connection"),
+            (
+                aiohttp.ServerFingerprintMismatch(b"x" * 32, b"y" * 32, "192.168.9.230", 8770),
+                "error:tls",
+            ),
+            (ssl.SSLError(1, f"bad cert {TOKEN}"), "error:tls"),
             (RuntimeError(f"boom {TOKEN}"), "error:invalid_response"),
         ],
     )

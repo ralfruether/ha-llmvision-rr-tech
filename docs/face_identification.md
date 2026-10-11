@@ -13,20 +13,35 @@ and the analysis continues exactly as without the option.
 
 ## Setup
 
-1. Run the face service (separate project) on a host in your LAN. It must accept
-   `POST /v1/identify?camera=<slug>` with the clip as `video/mp4` body and an
+1. Run the face service (separate project) on a host in your LAN, over HTTPS. It must
+   accept `POST /v1/identify?camera=<slug>&deadline_s=<s>` with the clip as `video/mp4`
+   body and an
    `Authorization: Bearer <token>` header.
 2. In Home Assistant open **Settings → Devices & services → LLM Vision → LLM Vision
    Settings → Reconfigure** and expand **Face identification (optional)**:
-   - **Face service URL**, e.g. `http://192.168.1.10:8770`. `https://` works for any
-     host; plain `http://` is only accepted for private/loopback IP addresses and
-     `.local`/`.lan` host names. Credentials, query strings and fragments are
-     rejected.
+   - **Face service URL**, e.g. `https://192.168.1.10:8770`. Only `https://` is
+     accepted, because every request carries the bearer token and a camera clip.
+     Credentials, query strings and fragments are rejected.
    - **Face service token**: the bearer token of the service (16–512 characters of
      `A–Z a–z 0–9 . _ ~ + / = -`). Required when a URL is set.
+   - **Face service certificate fingerprint (SHA-256)** of the service's certificate,
+     64 hex characters (colons and either case are accepted), as printed by
+     `python -m face_service.service tls fingerprint` or
+     `openssl x509 -in api.crt -noout -fingerprint -sha256`. Required for private,
+     loopback and link-local IP addresses and `.local`/`.lan` host names, which cannot
+     have a publicly trusted certificate: Home Assistant then accepts exactly this
+     certificate (chain, host name and expiry are not checked; the pin replaces them).
+     Without a fingerprint (public host names only) the usual certificate checks apply.
 
-   Clear the URL to disable the feature. Existing installations need no migration:
-   entries without these fields behave as "disabled".
+   Clear the URL to disable the feature. Entries without these fields behave as
+   "disabled". An entry that is no longer valid, such as a plain `http://` URL from
+   an earlier version or a LAN URL without fingerprint, is not silently disabled:
+   every call with `identify_persons: true` reports `face_service: error:misconfigured`
+   and logs a warning until the settings are fixed.
+
+   Renewing the face service certificate changes its fingerprint: update the pin right
+   after restarting the service with the new certificate; until then requests fail with
+   `error:tls`.
 3. Set `identify_persons: true` on the service call:
 
 ```yaml
@@ -56,16 +71,17 @@ data:
   `camera.` or the video file stem (for generic names such as `clip.mp4` the parent
   folder name before the first `_<digit>`).
 - In stream mode the request runs while the camera's capture lock is still held, so
-  a follow-up capture of the same camera can start up to 20 seconds later (40 seconds
+  a follow-up capture of the same camera can start up to 30 seconds later (45 seconds
   for `haustuer`, see below).
 - Clips larger than 64 MB are not uploaded (`error:too_large`), and only ISO-BMFF
   video files (mp4/m4v/mov with an `ftyp` header) are ever sent (`error:no_clip`
   otherwise). In snapshot mode the clip is read while the camera lock is still held,
   so a follow-up capture to the same `clip_path` cannot replace it before upload.
-  The request has a total timeout of 20 seconds (40 seconds for the camera slug
-  `haustuer`, whose clips take longest when several cameras upload at once;
-  `CAMERA_REQUEST_TIMEOUTS` in `face_client.py`), follows no redirects and accepts
-  at most 256 KiB of JSON.
+  The request has a total timeout of 30 seconds (45 seconds for the camera slug
+  `haustuer`, whose long clips take longest; `CAMERA_REQUEST_TIMEOUTS` in
+  `face_client.py`), sends that timeout as `deadline_s` so the service drops the
+  request if it is still queued when Home Assistant has given up, follows no
+  redirects and accepts at most 256 KiB of JSON.
 - `stream_analyzer_pro` transcodes the clip to H.264 capped at 1920 px by default.
   With `record_codec: copy` the face service receives the original camera stream
   (native resolution, compressed only once, e.g. H.265), which matches the
@@ -88,8 +104,10 @@ With `identify_persons: true` the service response additionally contains:
 
 - `persons`: `[{"name": "lea", "score": 0.756}, …]`
 - `face_service`: `ok`, `disabled` (not configured) or `error:<reason>` with reason
-  `timeout`, `connection`, `http_<status>`, `redirect`, `invalid_response`,
-  `too_large` or `no_clip` (the first failure when several clips were sent)
+  `timeout`, `connection`, `tls` (certificate does not match the pinned fingerprint or
+  the TLS handshake failed), `http_<status>`, `redirect`, `invalid_response`,
+  `too_large`, `no_clip` or `misconfigured` (the stored settings are no longer valid)
+  (the first failure when several clips were sent)
 - `face_service_ms`: duration of the longest identification request
 
 Appearance re-identification (shadow mode, only when the face service runs with
@@ -174,8 +192,9 @@ With `debug_polylines: true`, every annotated frame in `debug` also lists the dr
   face, can be named. They stay out of the prompt, the labels and the cloud, and are
   reported for evaluation only. Whole-body matching is personal data too; inform the
   household and regular visitors.
-- **Plain HTTP in the LAN.** With an `http://` URL the clip and the bearer token are
-  sent unencrypted; anyone able to read LAN traffic can capture them. Prefer
-  `https://` or an isolated network segment. The token is stored in the Home
-  Assistant config entry (like provider API keys) and is never logged by the face
-  client.
+- **Encrypted and pinned.** Clips and the bearer token are only sent over HTTPS, and
+  for LAN hosts only to the server holding the pinned certificate, so they cannot be
+  read or captured from LAN traffic. TLS proves the server's identity only: keep the
+  face service's client allow-list, the token and a firewall rule for its port. The
+  token is stored in the Home Assistant config entry (like provider API keys) and is
+  never logged by the face client; the fingerprint is not secret.

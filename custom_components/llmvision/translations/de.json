@@ -420,11 +420,13 @@
                         "description": "Sendet aufgezeichnete Clips optional an einen lokalen Gesichtserkennungsdienst, damit video_analyzer_pro und stream_analyzer_pro bekannte Haushaltsmitglieder benennen können (Service-Option identify_persons). Dies ist eine biometrische Identifikation: erkannte Namen werden an deinen KI-Anbieter gesendet. Verwende Identitäten niemals, um Schlösser, Alarme oder andere Sicherheitsaktionen auszulösen.",
                         "data": {
                             "face_service_url": "URL des Gesichtserkennungsdienstes",
-                            "face_service_token": "Token des Gesichtserkennungsdienstes"
+                            "face_service_token": "Token des Gesichtserkennungsdienstes",
+                            "face_service_cert_fingerprint": "Zertifikats-Fingerabdruck des Gesichtserkennungsdienstes (SHA-256)"
                         },
                         "data_description": {
-                            "face_service_url": "Basis-URL des Dienstes, z. B. http://192.168.1.10:8770. Unverschlüsseltes http ist nur für private IP-Adressen und .local/.lan-Hosts erlaubt. Leer lassen zum Deaktivieren.",
-                            "face_service_token": "Bearer-Token des Dienstes (16-512 Zeichen). Erforderlich, wenn eine URL gesetzt ist."
+                            "face_service_url": "Basis-URL des Dienstes, z. B. https://192.168.1.10:8770. Nur https ist erlaubt. Leer lassen zum Deaktivieren.",
+                            "face_service_token": "Bearer-Token des Dienstes (16-512 Zeichen). Erforderlich, wenn eine URL gesetzt ist.",
+                            "face_service_cert_fingerprint": "SHA-256-Fingerabdruck des Zertifikats des Dienstes (python -m face_service.service tls fingerprint). Erforderlich für private IP-Adressen und .local/.lan-Hosts; Home Assistant akzeptiert dann nur dieses Zertifikat. Nach jeder Erneuerung des Zertifikats aktualisieren."
                         }
                     }
                 }
@@ -437,8 +439,10 @@
             "memory_not_supported": "Dieser Anbieter unterstützt keine Erinnerungen.",
             "invalid_image_path": "Ein oder mehrere Bildpfade sind ungültig.",
             "mismatched_lengths": "Die Anzahl der Bildpfade und Beschreibungen muss übereinstimmen.",
-            "invalid_face_service_url": "Ungültige URL des Gesichtserkennungsdienstes. Verwende http(s)://host[:port] ohne Zugangsdaten, Query oder Fragment; unverschlüsseltes http nur für private IP-Adressen oder .local/.lan-Hosts.",
-            "invalid_face_service_token": "Ungültiges Token des Gesichtserkennungsdienstes. Es ist erforderlich, wenn eine URL gesetzt ist, und muss 16-512 Zeichen lang sein (Buchstaben, Ziffern und ._~+/=-)."
+            "invalid_face_service_url": "Ungültige URL des Gesichtserkennungsdienstes. Verwende https://host[:port] ohne Zugangsdaten, Query oder Fragment.",
+            "invalid_face_service_token": "Ungültiges Token des Gesichtserkennungsdienstes. Es ist erforderlich, wenn eine URL gesetzt ist, und muss 16-512 Zeichen lang sein (Buchstaben, Ziffern und ._~+/=-).",
+            "invalid_face_service_cert_fingerprint": "Ungültiger Zertifikats-Fingerabdruck. Gib den SHA-256-Fingerabdruck als 64 Hexadezimalzeichen ein (Doppelpunkte erlaubt).",
+            "face_service_cert_fingerprint_required": "Für einen Gesichtserkennungsdienst mit privater IP-Adresse oder .local/.lan-Host ist ein Zertifikats-Fingerabdruck erforderlich."
         },
         "abort": {
             "unknown_provider": "Unbekannter Anbieter",

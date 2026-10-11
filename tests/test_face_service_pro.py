@@ -17,7 +17,7 @@ from custom_components.llmvision.face_client import (
 )
 from custom_components.llmvision.media_handlers import MediaProcessor
 
-SETTINGS = FaceSettings(url="http://192.168.9.230:8770", token="t" * 32)
+SETTINGS = FaceSettings(url="https://192.168.9.230:8770", token="t" * 32, fingerprint="ab" * 32)
 BOX = (0.4, 0.4, 0.6, 0.6)
 SIZE = (200, 100)
 UNDECODABLE = b"\xff\xd8garbage\xff\xd9"
