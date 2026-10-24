@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- `llmvision.store_analysis_record` writes `analysis.json` with mode 0640 instead of
+  0600, so a separate non-root reader in the evidence directory's group (for example
+  an archive uploader) can read records. Other users still get no access. If the
+  file system refuses `chmod`, the record keeps its default mode (0600 on local file
+  systems) as before. Records written earlier keep 0600 until they are rewritten.
+
 ## 1.7.2.23 - 2026-10-11
 
 ### Changed

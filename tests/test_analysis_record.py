@@ -1,6 +1,8 @@
 """Tests for llmvision.store_analysis_record (analysis.json next to clip and snapshots)."""
 import json
+import logging
 import os
+import stat
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -95,6 +97,56 @@ class TestStore:
         monkeypatch.setattr(analysis_record, "write_record", fail)
         with pytest.raises(ServiceValidationError, match="PermissionError"):
             await analysis_record.async_store_analysis_record(_hass(), "camera-analysis/d", {})
+
+
+class TestFileMode:
+    @pytest.fixture
+    def umask(self):
+        previous = os.umask(0o022)
+        yield os.umask
+        os.umask(previous)
+
+    @pytest.mark.parametrize("mask", [0o077, 0o022, 0o002])
+    def test_record_is_group_readable_whatever_the_umask(self, media, umask, mask):
+        umask(mask)
+        directory = str(media / "camera-analysis" / "m")
+        path = analysis_record.write_record(directory, b"{}")
+        assert stat.S_IMODE(os.stat(path).st_mode) == 0o640
+
+    def test_rewrite_keeps_the_mode_and_leaves_no_temp_file(self, media, umask):
+        umask(0o077)
+        directory = str(media / "camera-analysis" / "r")
+        analysis_record.write_record(directory, b'{"a": 1}')
+        path = analysis_record.write_record(directory, b'{"a": 2}')
+        assert stat.S_IMODE(os.stat(path).st_mode) == 0o640
+        assert os.listdir(directory) == ["analysis.json"]
+
+    def test_chmod_refused_still_writes_a_private_record(self, media, monkeypatch, caplog):
+        def refuse(_fd, _mode):
+            raise PermissionError("not supported for /secret/path")
+
+        monkeypatch.setattr(analysis_record.os, "fchmod", refuse)
+        directory = str(media / "camera-analysis" / "f")
+        with caplog.at_level(logging.DEBUG, logger=analysis_record.__name__):
+            path = analysis_record.write_record(directory, b'{"a": 1}')
+        assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+        assert json.loads(open(path, encoding="utf-8").read()) == {"a": 1}
+        assert os.listdir(directory) == ["analysis.json"]
+        assert [r.levelno for r in caplog.records] == [logging.DEBUG]
+        assert "PermissionError" in caplog.text
+        assert "/secret/path" not in caplog.text and directory not in caplog.text
+
+    @pytest.mark.skipif(len(os.getgroups()) < 2, reason="needs a second group")
+    def test_setgid_directory_group_is_inherited(self, media):
+        directory = media / "camera-analysis" / "g"
+        directory.mkdir(parents=True)
+        group = next(gid for gid in os.getgroups() if gid != os.getegid())
+        os.chown(directory, -1, group)
+        os.chmod(directory, 0o2750)
+        path = analysis_record.write_record(str(directory), b"{}")
+        info = os.stat(path)
+        assert info.st_gid == group
+        assert stat.S_IMODE(info.st_mode) == 0o640
 
 
 def test_service_is_registered():

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import errno
 import json
+import logging
 import os
 import re
 import stat
@@ -20,9 +21,14 @@ from homeassistant.exceptions import ServiceValidationError
 
 from .const import DOMAIN
 
+_LOGGER = logging.getLogger(__name__)
+
 MEDIA_ROOT = "/media"
 RECORD_FILENAME = "analysis.json"
 MAX_RECORD_BYTES = 4 * 1024 * 1024
+# Group-readable so a separate non-root reader (for example an archive uploader in the
+# directory's group) can read records; others get nothing (mkstemp alone gives 0600).
+RECORD_FILE_MODE = 0o640
 # Read access (admin-only HTTP views): only <MEDIA_ROOT>/llmvision/camera-analysis/<id>/.
 # Ids are camera + timestamp, i.e. presence metadata; records hold identification data.
 RECORDS_SUBDIR = "camera-analysis"
@@ -70,6 +76,11 @@ def write_record(directory: str, data: bytes) -> str:
     target = os.path.join(directory, RECORD_FILENAME)
     fd, tmp = tempfile.mkstemp(prefix=".analysis-", suffix=".tmp", dir=directory)
     try:
+        try:
+            os.fchmod(fd, RECORD_FILE_MODE)
+        except OSError as err:
+            # Some network/FAT mounts refuse chmod: keep the file's default mode.
+            _LOGGER.debug("Keeping the default mode for %s: %s", RECORD_FILENAME, type(err).__name__)
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
         os.replace(tmp, target)
