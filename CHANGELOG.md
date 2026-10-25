@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- `pretrigger_frame`: the capture time stated in the prompt is computed in UTC, so it
+  is no longer an hour off when a DST change falls between the previous capture and
+  the current call. Whether the frame is used, and its age, were not affected.
+
 ## 1.7.2.25 - 2026-10-25
 
 ### Added

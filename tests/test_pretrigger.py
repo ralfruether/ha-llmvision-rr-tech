@@ -4,13 +4,14 @@ import base64
 import io
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pytest
 from unittest.mock import AsyncMock, Mock, patch
 from PIL import Image
 
 from homeassistant.exceptions import ServiceValidationError
+from homeassistant.util import dt as dt_util
 
 from custom_components.llmvision import face_client, pretrigger
 from custom_components.llmvision.const import CONF_PROVIDER, DOMAIN
@@ -56,6 +57,24 @@ def _entry(monotonic, names=None, provider="p"):
 
 
 class TestModule:
+    def test_capture_wall_time_across_dst_rollback(self):
+        berlin = dt_util.get_time_zone("Europe/Berlin")
+        previous = dt_util.get_default_time_zone()
+        dt_util.set_default_time_zone(berlin)
+        try:
+            # 25 Oct 2026, 02:30 CET = 01:30 UTC; captured one hour earlier at
+            # 02:30 CEST (00:30 UTC), before the clocks went back at 03:00 CEST
+            utc_now = datetime(2026, 10, 25, 1, 30, tzinfo=dt_util.UTC)
+            captured = pretrigger.capture_wall_time(100.0, 3700.0, utc_now)
+            assert captured.isoformat() == "2026-10-25T02:30:00+02:00"
+            assert utc_now - captured == timedelta(hours=1)
+        finally:
+            dt_util.set_default_time_zone(previous)
+
+    def test_capture_wall_time_never_in_the_future(self):
+        utc_now = datetime(2026, 10, 25, 12, 0, tzinfo=dt_util.UTC)
+        assert pretrigger.capture_wall_time(10.0, 5.0, utc_now) == utc_now
+
     def test_household_names_face_only(self):
         appearance = AppearanceInfo(
             status="ok",

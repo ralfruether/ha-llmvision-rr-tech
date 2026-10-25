@@ -1133,8 +1133,9 @@ def setup(hass, config):
                         # so an arrival is always analyzed before it becomes context.
                         current_pretrigger = pretrigger.PretriggerEntry(
                             frame=frame,
-                            captured_at=dt_util.as_local(dt_util.now())
-                            - timedelta(seconds=time.monotonic() - captured_monotonic),
+                            captured_at=pretrigger.capture_wall_time(
+                                captured_monotonic
+                            ),
                             monotonic=captured_monotonic,
                             provider=call.provider,
                         )

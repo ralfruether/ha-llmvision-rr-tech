@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import itertools
 from dataclasses import dataclass, field
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
+
+from homeassistant.util import dt as dt_util
 
 from . import face_client
 
@@ -33,6 +36,21 @@ class PretriggerEntry:
     provider: str
     # None when recognition did not run or did not succeed for every clip
     names: tuple[str, ...] | None = field(default=None, repr=False)
+
+
+def capture_wall_time(
+    captured_monotonic: float,
+    now_monotonic: float | None = None,
+    utc_now: datetime | None = None,
+) -> datetime:
+    """Local wall-clock time of a monotonic capture stamp. Subtracts in UTC, because
+    aware local datetimes ignore a DST change between the two times."""
+    if now_monotonic is None:
+        now_monotonic = time.monotonic()
+    if utc_now is None:
+        utc_now = dt_util.utcnow()
+    elapsed = max(0.0, now_monotonic - captured_monotonic)
+    return dt_util.as_local(utc_now - timedelta(seconds=elapsed))
 
 
 def household_names(results) -> tuple[str, ...] | None:
