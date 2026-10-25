@@ -309,6 +309,11 @@ class Request:
         self.base64_images.append(base64_image)
         self.filenames.append(filename)
 
+    def prepend_frame(self, base64_image, filename):
+        """Insert a frame before all others (stream_analyzer_pro pre-trigger frame)."""
+        self.base64_images.insert(0, base64_image)
+        self.filenames.insert(0, filename)
+
     def heal_json(self, text):
         """Attempt to heal malformed JSON for common LLM output issues."""
         if not isinstance(text, str):

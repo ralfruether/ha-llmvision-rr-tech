@@ -5,9 +5,9 @@ from .timeline import Timeline
 from .providers import Request
 from .memory import Memory
 from .media_handlers import MediaProcessor
-from . import analysis_record, face_client
-from .stream_capture import PRO_FFMPEG_JPEG_Q, PRO_JPEG_OPTIONS
-import os, re
+from . import analysis_record, face_client, pretrigger
+from .stream_capture import PRO_FFMPEG_JPEG_Q, PRO_JPEG_OPTIONS, coerce_number
+import os, re, time
 from datetime import timedelta
 from homeassistant.util import dt as dt_util
 from homeassistant.config_entries import ConfigEntry
@@ -81,6 +81,9 @@ from .const import (
     COALESCE_WHILE_RECORDING,
     MOTION_ENTITY,
     IDENTIFY_PERSONS,
+    PRETRIGGER_FRAME,
+    PRETRIGGER_MAX_AGE,
+    DEFAULT_PRETRIGGER_MAX_AGE,
     DATA_EXTRACTION_PROMPT,
     DEFAULT_OPENAI_MODEL,
     DEFAULT_ANTHROPIC_MODEL,
@@ -529,6 +532,12 @@ class ServiceCallData:
         self.identify_persons: bool = (
             data_call.data.get(IDENTIFY_PERSONS, False) is True
         )
+        self.pretrigger_frame: bool = (
+            data_call.data.get(PRETRIGGER_FRAME, False) is True
+        )
+        self.pretrigger_max_age = data_call.data.get(
+            PRETRIGGER_MAX_AGE, DEFAULT_PRETRIGGER_MAX_AGE
+        )
         self.structure: dict | None = data_call.data.get(STRUCTURE, None)
         self.title_field: str = data_call.data.get(TITLE_FIELD, "")
         self.description_field: str = data_call.data.get(DESCRIPTION_FIELD, "")
@@ -750,6 +759,8 @@ def _add_face_response(call, processor, response: dict) -> None:
 def setup(hass, config):
     stream_capture_locks = {}
     pending_stream_captures = {}
+    # Camera entity -> PretriggerEntry of its last stream_analyzer_pro run (RAM only)
+    pretrigger_frames = pretrigger.PretriggerCache()
 
     async def acquire_stream_capture_locks(
         image_entities, coalesce_while_recording=False
@@ -985,6 +996,9 @@ def setup(hass, config):
     async def stream_analyzer_pro(data_call):
         """Handle the service call to analyze a stream with advanced options."""
         start = dt_util.now()
+        # The trigger time: a queued capture must not use frames newer than its call
+        trigger_monotonic = time.monotonic()
+        pretrigger_seq = pretrigger_frames.next_seq()
         call = ServiceCallData(data_call).get_service_call_data()
         call.message = (
             "The attached images are frames from a live camera feed. " + call.message
@@ -1018,6 +1032,32 @@ def setup(hass, config):
                         "coalesce_while_recording requires at least one binary_sensor "
                         "motion_entity"
                     )
+            pretrigger_max_age = None
+            target_width = call.target_width
+            pretrigger_frames.prune(trigger_monotonic)
+            if call.pretrigger_frame:
+                if len(image_entities) != 1:
+                    raise ServiceValidationError(
+                        "pretrigger_frame requires exactly one camera entity"
+                    )
+                pretrigger_max_age = coerce_number(
+                    call.pretrigger_max_age,
+                    "pretrigger_max_age",
+                    pretrigger.MIN_MAX_AGE,
+                    pretrigger.MAX_MAX_AGE,
+                )
+                if pretrigger_max_age is None:
+                    pretrigger_max_age = DEFAULT_PRETRIGGER_MAX_AGE
+                target_width = coerce_number(
+                    target_width, "target_width", 64, 7680, integer=True,
+                    allow_none=False,
+                )
+            else:
+                for entity_id in image_entities:
+                    pretrigger_frames.publish(
+                        entity_id, pretrigger_seq, None, trigger_monotonic
+                    )
+            current_pretrigger = None
 
             (
                 capture_locks,
@@ -1080,6 +1120,24 @@ def setup(hass, config):
                     frame_source=call.frame_source,
                     record_codec=call.record_codec,
                 )
+                if call.pretrigger_frame:
+                    captured = processor.last_frames.get(image_entities[0])
+                    if (
+                        isinstance(captured, tuple)
+                        and len(captured) == 2
+                        and isinstance(captured[0], bytes)
+                        and 0 < len(captured[0]) <= pretrigger.MAX_FRAME_BYTES
+                    ):
+                        frame, captured_monotonic = captured
+                        # Published only after a successful model call (see below),
+                        # so an arrival is always analyzed before it becomes context.
+                        current_pretrigger = pretrigger.PretriggerEntry(
+                            frame=frame,
+                            captured_at=dt_util.as_local(dt_util.now())
+                            - timedelta(seconds=time.monotonic() - captured_monotonic),
+                            monotonic=captured_monotonic,
+                            provider=call.provider,
+                        )
                 clip_task = getattr(processor, "clip_task", None)
                 if asyncio.isfuture(clip_task):
                     await clip_task
@@ -1103,10 +1161,65 @@ def setup(hass, config):
                 # Snapshot clips are identified outside the camera locks
                 await processor.identify_recorded_clips()
             _append_face_facts(call, processor)
+            if current_pretrigger is not None and processor.face_settings is not None:
+                current_pretrigger.names = pretrigger.household_names(
+                    processor.face_results
+                )
+            pretrigger_info = None
+            if call.pretrigger_frame:
+                pretrigger_info = {"used": False, "age_s": None}
+                previous_pretrigger = pretrigger_frames.get(image_entities[0])
+                age_s = pretrigger.usable_age(
+                    previous_pretrigger,
+                    trigger_monotonic,
+                    pretrigger_max_age,
+                    call.provider,
+                )
+                provider_entry = hass.data.get(DOMAIN, {}).get(call.provider)
+                if (
+                    age_s is not None
+                    and isinstance(provider_entry, dict)
+                    and provider_entry.get(CONF_PROVIDER) == "Groq"
+                ):
+                    # Groq accepts a single image only
+                    _LOGGER.info("Pre-trigger frame skipped: provider accepts one image")
+                    age_s = None
+                if age_s is not None:
+                    label = pretrigger.frame_label(
+                        image_entities[0], call.include_filename
+                    )
+                    try:
+                        await processor.add_pretrigger_frame(
+                            image_data=previous_pretrigger.frame,
+                            label=label,
+                            target_width=target_width,
+                            polylines=call.polylines,
+                            storage_path=call.storage_path or None,
+                        )
+                    except Exception as err:  # never fail the analysis for it
+                        _LOGGER.warning(f"Pre-trigger frame not used: {err}")
+                    else:
+                        call.message = (
+                            f"{call.message}\n\n"
+                            f"{pretrigger.fact_text(label, previous_pretrigger, age_s)}"
+                        )
+                        pretrigger_info = {"used": True, "age_s": age_s}
+                        _LOGGER.info(f"Pre-trigger frame added ({age_s} s old)")
             call.memory = Memory(hass)
             await call.memory._update_memory()
 
             response = await request.call(call)
+            if call.pretrigger_frame:
+                # Also a run without a cacheable frame clears the older one, so the
+                # next run never skips over this one
+                pretrigger_frames.publish(
+                    image_entities[0],
+                    pretrigger_seq,
+                    current_pretrigger,
+                    time.monotonic(),
+                )
+            if pretrigger_info is not None:
+                response["pretrigger"] = pretrigger_info
             if call.coalesce_while_recording:
                 response["capture"] = {
                     "status": "completed",

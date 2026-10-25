@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `stream_analyzer_pro` option `pretrigger_frame` (off by default) with
+  `pretrigger_max_age` (60-3600 s, default 900). The last captured frame of a camera's
+  previous successful analysis is kept in memory and sent first in the camera's next
+  analysis, labeled `<camera>-vortrigger`, drawn with the same polylines but without
+  face labels, and outside `max_frames`. A prompt paragraph states its capture time,
+  its age, and which household members local face recognition identified in that
+  previous analysis (face matches only, never appearance matches or model output).
+  This lets the model tell an object that was already parked in the private zone from
+  one that just arrived. Requires exactly one camera. Frames older than the max age,
+  captured after this call was triggered, cached for another provider, or larger than
+  4 MiB are not used, a failed model call never becomes context, and an older call
+  finishing late never replaces a newer frame or a newer opt-out. Skipped for Groq
+  (one image per request). The response
+  gets `pretrigger: {used, age_s}`; with `storage_path` the frame is also stored as
+  `<camera>-vortrigger.jpg`. The cache lives in RAM only and is lost on restart.
+
 ## 1.7.2.24 - 2026-10-24
 
 ### Changed

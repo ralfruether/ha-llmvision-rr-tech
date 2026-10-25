@@ -139,6 +139,9 @@ class MediaProcessor:
         self._face_stream_frames = {}
         # Camera entity -> requested clip path (None when no clip is recorded)
         self._face_clip_plan = {}
+        # Camera entity -> (raw JPEG of the last captured frame, time.monotonic() at
+        # the end of capture), used by stream_analyzer_pro's pretrigger_frame
+        self.last_frames = {}
 
     @property
     def face_active(self):
@@ -1414,6 +1417,8 @@ class MediaProcessor:
         interval = self._compute_interval(duration, fps)
         camera_frames = {}
         first_frames = {}
+        # Snapshot mode: when each camera's latest frame was fetched (pre-trigger age)
+        fetched_at = {}
         # Track successful image entities (cameras that successfully captured frames)
         successful_image_entities = set()
 
@@ -1457,6 +1462,7 @@ class MediaProcessor:
 
                 fetch_duration = time.time() - fetch_start_time
                 _LOGGER.info(f"Fetched {image_entity} in {fetch_duration:.2f} seconds")
+                fetched_at[image_entity] = time.monotonic()
 
                 preprocessing_start_time = time.time()
 
@@ -1588,6 +1594,21 @@ class MediaProcessor:
         if len(successful_image_entities) == 0:
             raise ServiceValidationError(
                 "No cameras available - all cameras offline or unavailable"
+            )
+
+        captured_monotonic = time.monotonic()
+        for image_entity in successful_image_entities:
+            captured = camera_frames.get(image_entity) or {}
+            if captured:
+                latest = max(captured.values(), key=lambda f: f["frame_index"])
+                last_frame = latest["frame_data"]
+            elif image_entity in first_frames:
+                last_frame = first_frames[image_entity][1]
+            else:
+                continue
+            self.last_frames[image_entity] = (
+                last_frame,
+                min(fetched_at.get(image_entity, captured_monotonic), captured_monotonic),
             )
 
         # Extract frames and their SSIM scores
@@ -2391,6 +2412,31 @@ class MediaProcessor:
                     path for path in self.requested_clip_paths if path in written
                 ]
         return self.client
+
+    async def add_pretrigger_frame(
+        self, image_data, label, target_width, polylines=None, storage_path=None
+    ):
+        """Send a cached frame of the camera's previous run before all other frames.
+
+        It gets the polylines but no face labels; with storage_path it is also stored
+        as <label>.jpg next to the analyzed snapshots for review.
+        """
+        polylines = self._validate_polylines(polylines)
+        base64_image, _, _, _ = await self._annotate_image(
+            image_data, target_width, polylines, None
+        )
+        if storage_path:
+            try:
+                await self._write_snapshot(
+                    directory=self._resolve_storage_path(storage_path),
+                    filename=f"{label.replace('/', '_').replace('..', '_')}.jpg",
+                    image_data=base64_image,
+                )
+            except Exception as err:  # the review copy is optional
+                _LOGGER.warning(f"Could not store the pre-trigger frame: {err}")
+        # Last, so a failure above never leaves the frame in the request without the
+        # caller's prompt paragraph that explains it
+        self.client.prepend_frame(base64_image=base64_image, filename=label)
 
     async def add_visual_data(
         self, image_entities, image_paths, target_width, include_filename, expose_images

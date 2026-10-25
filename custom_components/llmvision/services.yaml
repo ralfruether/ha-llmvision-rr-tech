@@ -777,6 +777,27 @@ stream_analyzer_pro:
       default: false
       selector:
         boolean:
+    pretrigger_frame:
+      name: Pre-trigger Frame
+      required: false
+      description: 'Single camera only. Keep the last captured frame of each successful run in memory (lost on restart) and send it as the first image of the next run of the same camera and provider when it is at most Pre-trigger Max Age old, labeled <camera>-vortrigger with its capture time and the household members face recognition (identify_persons) identified in that run. Lets the prompt tell objects that were already there from new arrivals. Skipped for Groq, which accepts one image only. With storage_path the frame is also stored there. The response gains pretrigger (used, age_s).'
+      example: true
+      default: false
+      selector:
+        boolean:
+    pretrigger_max_age:
+      name: Pre-trigger Max Age
+      required: false
+      description: 'Maximum age in seconds of the pre-trigger frame (60-3600, default 900). Older frames are not sent.'
+      example: 900
+      default: 900
+      selector:
+        number:
+          min: 60
+          max: 3600
+          step: 1
+          unit_of_measurement: s
+          mode: box
     clip_path:
       name: Clip Path
       required: false

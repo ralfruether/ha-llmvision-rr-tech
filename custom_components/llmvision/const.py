@@ -100,6 +100,9 @@ FRAME_SOURCE = "frame_source"
 COALESCE_WHILE_RECORDING = "coalesce_while_recording"
 MOTION_ENTITY = "motion_entity"
 IDENTIFY_PERSONS = "identify_persons"
+PRETRIGGER_FRAME = "pretrigger_frame"
+PRETRIGGER_MAX_AGE = "pretrigger_max_age"
+DEFAULT_PRETRIGGER_MAX_AGE = 900
 
 # Error messages
 ERROR_NOT_CONFIGURED = "{provider} is not configured"
