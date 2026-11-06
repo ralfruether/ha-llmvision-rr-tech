@@ -4,7 +4,9 @@ import datetime
 import os
 import asyncio
 from unittest.mock import Mock, patch, AsyncMock, MagicMock
+from zoneinfo import ZoneInfo
 from homeassistant.components.calendar import CalendarEvent
+from homeassistant.util import dt as dt_util
 
 
 class MockTimelineEvent:
@@ -128,6 +130,79 @@ class TestCalendar:
         await calendar_instance.async_update()
 
         assert calendar_instance._events == []
+
+    @pytest.mark.parametrize("method", ["async_update", "async_get_events"])
+    @patch.object(dt_util, "DEFAULT_TIME_ZONE", ZoneInfo("Europe/Berlin"))
+    async def test_rollback_and_invalid_history(
+        self, calendar_instance, mock_timeline, caplog, method
+    ):
+        """Real HA local-time validation must not discard a valid fold crossing."""
+        berlin = ZoneInfo("Europe/Berlin")
+        start = datetime.datetime(2026, 10, 25, 2, 59, 18, 801037, tzinfo=berlin)
+        end = datetime.datetime(2026, 10, 25, 2, 1, 21, 387204,
+                                tzinfo=berlin, fold=1)
+        healthy_start = datetime.datetime(2026, 10, 25, 2, 30,
+                                          tzinfo=berlin, fold=1)
+        events = [
+            MockTimelineEvent("rollback", "Rollback", start, end, "private text"),
+            MockTimelineEvent("invalid", "Invalid", start,
+                              end.replace(fold=0), "private text"),
+            MockTimelineEvent("healthy", "Healthy", healthy_start,
+                              healthy_start.astimezone(datetime.timezone.utc)
+                              + datetime.timedelta(minutes=1), ""),
+            MockTimelineEvent("missing", "Missing", None, None, ""),
+            MockTimelineEvent("zero", "Zero", end, end, ""),
+        ]
+        original_endpoints = [(e.start, e.end) for e in events]
+        mock_timeline.get_all_events.return_value = events
+        if method == "async_update":
+            await calendar_instance.async_update()
+            result = calendar_instance._events
+            # Local wall times would put rollback first; UTC puts healthy first.
+            assert result[0].uid == "healthy"
+            assert calendar_instance.extra_state_attributes["title"] == "Healthy"
+        else:
+            result = await calendar_instance.async_get_events(
+                calendar_instance.hass,
+                datetime.datetime(2026, 10, 25, 2, 0, tzinfo=berlin, fold=1),
+                datetime.datetime(2026, 10, 25, 3, 0, tzinfo=berlin),
+            )
+        assert {e.uid for e in result} == {"rollback", "healthy", "zero"}
+        rollback = next(e for e in result if e.uid == "rollback")
+        assert isinstance(rollback, CalendarEvent)
+        assert rollback.end - rollback.start == datetime.timedelta(
+            minutes=2, seconds=2, microseconds=586167
+        )
+        assert rollback.as_dict()["start"] == start.astimezone(
+            datetime.timezone.utc
+        ).isoformat()
+        assert [(e.start, e.end) for e in events] == original_endpoints
+        mock_timeline.load_events.assert_awaited_once_with(purge_expired=False)
+        mock_timeline.delete_event.assert_not_awaited()
+        assert caplog.text.count("Skipping timeline event with invalid interval") == 2
+        assert "private text" not in caplog.text
+
+    async def test_rollback_query_uses_absolute_exclusive_boundaries(
+        self, calendar_instance, mock_timeline
+    ):
+        berlin = ZoneInfo("Europe/Berlin")
+        start = datetime.datetime(2026, 10, 25, 2, 59, tzinfo=berlin)
+        end = datetime.datetime(2026, 10, 25, 2, 1, tzinfo=berlin, fold=1)
+        mock_timeline.get_all_events.return_value = [
+            MockTimelineEvent("rollback", "Rollback", start, end, "")
+        ]
+        # Query ends exactly at the event start: no overlap.
+        result = await calendar_instance.async_get_events(
+            calendar_instance.hass,
+            datetime.datetime(2026, 10, 25, 2, 30, tzinfo=berlin), start,
+        )
+        assert result == []
+        # Query starts exactly at the event end: no overlap.
+        result = await calendar_instance.async_get_events(
+            calendar_instance.hass, end,
+            datetime.datetime(2026, 10, 25, 2, 30, tzinfo=berlin, fold=1),
+        )
+        assert result == []
 
     @pytest.mark.asyncio
     async def test_async_update_with_events(self, calendar_instance, mock_timeline):

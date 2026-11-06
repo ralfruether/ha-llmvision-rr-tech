@@ -4,10 +4,13 @@ import datetime
 import os
 import uuid
 from functools import partial
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
+from zoneinfo import ZoneInfo
 
 import aiosqlite
 import pytest
+from homeassistant.exceptions import ServiceValidationError
 
 from custom_components.llmvision.const import (
     CONF_RETENTION_TIME,
@@ -335,6 +338,166 @@ class TestCategoryPriorityAndWordBoundaries:
 # ===========================================================================
 # Event class
 # ===========================================================================
+
+
+class TestDSTIntervals:
+    """Writes and calendar reads must preserve history while comparing instants."""
+
+    @pytest.mark.parametrize("boundary", ["create", "insert", "update"])
+    @pytest.mark.parametrize("inputs", ["naive", "default", "start_naive", "end_naive"])
+    @patch.object(dt_util, "DEFAULT_TIME_ZONE", ZoneInfo("Europe/Berlin"))
+    async def test_writes_serialize_the_validated_utc_instants(
+        self, build_timeline, boundary, inputs
+    ):
+        """Naive endpoints must not become local instants after UTC validation."""
+        from custom_components.llmvision import ServiceCallData
+        from custom_components.llmvision.event_times import as_utc
+
+        tl = build_timeline()
+        await tl._initialize_db()
+        start = datetime.datetime(2026, 1, 1, 12)
+        end = datetime.datetime(2026, 1, 1, 12, 30)
+        if inputs == "default":
+            call = ServiceCallData(SimpleNamespace(data={"start_time": start}))
+            end = call.end_time
+        elif inputs == "start_naive":
+            end = end.replace(tzinfo=datetime.timezone.utc)
+        elif inputs == "end_naive":
+            start = start.replace(tzinfo=datetime.timezone.utc)
+        expected_start, expected_end = as_utc(start), as_utc(end)
+        values = dict(start=start, end=end, title="new", description="",
+                      key_frame="", camera_name="", label="person")
+        if boundary == "create":
+            await tl.create_event(**values)
+        elif boundary == "insert":
+            await tl._insert_event(Event(uid="new", category="person", **values))
+        else:
+            await tl._insert_event(Event(
+                uid="new", category="person",
+                **{**values, "start": expected_start, "end": expected_start}
+            ))
+            await tl.update_event(uid="new", **values)
+        row = (await self._rows(tl))[0]
+        stored_start = datetime.datetime.fromisoformat(row[2])
+        stored_end = datetime.datetime.fromisoformat(row[3])
+        assert stored_start.astimezone(datetime.timezone.utc) == expected_start
+        assert stored_end.astimezone(datetime.timezone.utc) == expected_end
+        assert stored_end - stored_start == expected_end - expected_start
+        if inputs == "default":
+            assert stored_end - stored_start == datetime.timedelta(minutes=1)
+
+    @pytest.mark.parametrize("boundary", ["create", "insert", "update"])
+    @pytest.mark.parametrize("folds", [(0, 0), (1, 0)])
+    async def test_invalid_write_has_no_side_effects(
+        self, build_timeline, boundary, folds
+    ):
+        tl = build_timeline()
+        await tl._initialize_db()
+        await _insert_rows(tl._db_path, [_make_row("existing", age_days=30)])
+        before = await self._rows(tl)
+        berlin = ZoneInfo("Europe/Berlin")
+        # Second case looks increasing by wall time, but is reversed in UTC.
+        start = datetime.datetime(2026, 10, 25, 2, 30, tzinfo=berlin, fold=folds[0])
+        end = datetime.datetime(2026, 10, 25, 2, 20 if folds[0] == 0 else 40,
+                                tzinfo=berlin, fold=folds[1])
+        values = dict(start=start, end=end, title="new", description="",
+                      key_frame="pending.jpg", camera_name="", label="")
+        with (
+            patch("custom_components.llmvision.timeline.aiosqlite.connect") as connect,
+            patch.object(tl, "load_events", new=AsyncMock()) as load,
+            patch("custom_components.llmvision.timeline._get_category_and_label",
+                  new=AsyncMock()) as category,
+        ):
+            with pytest.raises(ServiceValidationError, match="end must not precede start"):
+                if boundary == "create":
+                    await tl.create_event(**values)
+                elif boundary == "update":
+                    await tl.update_event(uid="existing", **values)
+                else:
+                    await tl._insert_event(Event(uid="new", category="", **values))
+            connect.assert_not_called()
+            load.assert_not_awaited()
+            category.assert_not_awaited()
+        assert not tl._pending_key_frames
+        assert await self._rows(tl) == before
+
+    @pytest.mark.parametrize("boundary", ["create", "insert", "update"])
+    @pytest.mark.parametrize("zero_duration", [False, True])
+    async def test_valid_write_preserves_existing_rows(
+        self, build_timeline, boundary, zero_duration
+    ):
+        tl = build_timeline()
+        await tl._initialize_db()
+        await _insert_rows(tl._db_path, [_make_row("existing", age_days=30)])
+        original = (await self._rows(tl))[0]
+        berlin = ZoneInfo("Europe/Berlin")
+        start = datetime.datetime(2026, 10, 25, 2, 59, tzinfo=berlin)
+        end = start if zero_duration else datetime.datetime(
+            2026, 10, 25, 2, 1, tzinfo=berlin, fold=1
+        )
+        values = dict(start=start, end=end, title="new", description="",
+                      key_frame="", camera_name="", label="person")
+        if boundary == "create":
+            await tl.create_event(**values)
+        else:
+            await tl._insert_event(Event(uid="new", category="person", **values))
+            if boundary == "update":
+                await tl.update_event(uid="new", **values)
+        rows = await self._rows(tl)
+        assert len(rows) == 2
+        assert original in rows
+        new_row = next(row for row in rows if row[1] == "new")
+        stored_start = datetime.datetime.fromisoformat(new_row[2])
+        stored_end = datetime.datetime.fromisoformat(new_row[3])
+        assert stored_start.astimezone(datetime.timezone.utc) == start.astimezone(
+            datetime.timezone.utc
+        )
+        assert stored_end.astimezone(datetime.timezone.utc) == end.astimezone(
+            datetime.timezone.utc
+        )
+
+    async def test_calendar_reads_do_not_change_any_persisted_rows(
+        self, build_timeline, caplog
+    ):
+        from custom_components.llmvision.calendar import Calendar
+
+        # Retention is intentionally enabled: calendar refresh must not purge.
+        tl = build_timeline(retention=1)
+        await tl._initialize_db()
+        rows = [
+            ("valid", "Valid", "2026-10-25T02:59:18.801037+02:00",
+             "2026-10-25T02:01:21.387204+01:00", "", "", "", "", ""),
+            ("invalid", "Invalid", "2026-10-25T02:59:18.801037+02:00",
+             "2026-10-25T02:01:21.387204+02:00", "", "", "", "", ""),
+            ("healthy", "Healthy", "2026-10-25T12:00:00+01:00",
+             "2026-10-25T12:01:00+01:00", "", "", "", "", ""),
+            ("malformed", "Malformed", "bad", "bad", "", "", "", "", ""),
+            _make_row("expired", age_days=365),
+        ]
+        await _insert_rows(tl._db_path, rows)
+        before = await self._rows(tl)
+        with patch("custom_components.llmvision.calendar.Timeline", return_value=tl):
+            calendar = Calendar(tl.hass, tl._config_entry)
+        with patch.object(tl, "_purge_expired_events", new=AsyncMock()) as purge:
+            await calendar.async_update()
+            assert {e.uid for e in calendar._events} == {
+                "valid", "healthy", rows[-1][0]
+            }
+            assert await self._rows(tl) == before
+            result = await calendar.async_get_events(
+                tl.hass, datetime.datetime(2026, 10, 25, tzinfo=datetime.timezone.utc),
+                datetime.datetime(2026, 10, 26, tzinfo=datetime.timezone.utc),
+            )
+            assert {e.uid for e in result} == {"valid", "healthy"}
+            purge.assert_not_awaited()
+        assert await self._rows(tl) == before
+        assert "Skipping timeline event with invalid interval" in caplog.text
+
+    @staticmethod
+    async def _rows(tl):
+        async with aiosqlite.connect(tl._db_path) as db:
+            async with db.execute("SELECT * FROM events ORDER BY uid") as cursor:
+                return await cursor.fetchall()
 
 
 class TestEvent:

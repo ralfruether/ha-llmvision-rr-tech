@@ -9,12 +9,24 @@ from .const import DOMAIN, CONF_RETENTION_TIME, CONF_TIMELINE_LANGUAGE
 from homeassistant.util import dt as dt_util
 from homeassistant.core import HomeAssistant
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.exceptions import ServiceValidationError
+from .event_times import validate_interval
 from functools import partial
 import logging
 
 _LOGGER = logging.getLogger(__name__)
 
 DB_VERSION = 4
+
+
+def _validate_write_interval(
+    start, end
+) -> tuple[datetime.datetime, datetime.datetime]:
+    """Reject invalid new intervals before any storage or media side effects."""
+    try:
+        return validate_interval(start, end)
+    except ValueError as err:
+        raise ServiceValidationError(str(err)) from err
 
 # Every Timeline instance must see the same pending key frames and cleanup lock;
 # otherwise one instance's cleanup deletes another request's in-flight snapshot.
@@ -625,9 +637,10 @@ class Timeline:
             if getattr(e, "key_frame", None)
         ]
 
-    async def load_events(self):
+    async def load_events(self, *, purge_expired: bool = True):
         """Loads events from the database into memory"""
-        await self._purge_expired_events()
+        if purge_expired:
+            await self._purge_expired_events()
         self.events = []
         try:
             async with aiosqlite.connect(self._db_path) as db:
@@ -828,6 +841,7 @@ class Timeline:
         if isinstance(end, str):
             end = datetime.datetime.fromisoformat(end)
 
+        start, end = _validate_write_interval(start, end)
         start = dt_util.as_local(start)
         end = dt_util.as_local(end)
 
@@ -882,6 +896,7 @@ class Timeline:
 
     async def _insert_event(self, event: Event) -> None:
         """Inserts a new event into the database"""
+        start, end = _validate_write_interval(event.start, event.end)
         try:
             async with aiosqlite.connect(self._db_path) as db:
                 _LOGGER.info(f"Inserting event into database: {event}")
@@ -893,10 +908,8 @@ class Timeline:
                     (
                         event.uid,
                         event.title,
-                        dt_util.as_local(
-                            self._ensure_datetime(event.start)
-                        ).isoformat(),
-                        dt_util.as_local(self._ensure_datetime(event.end)).isoformat(),
+                        dt_util.as_local(start).isoformat(),
+                        dt_util.as_local(end).isoformat(),
                         event.description,
                         event.key_frame,
                         event.camera_name,
@@ -905,7 +918,7 @@ class Timeline:
                     ),
                 )
                 await db.commit()
-                await self.load_events()
+                await self.load_events(purge_expired=False)
         except aiosqlite.Error as e:
             _LOGGER.error(f"Error inserting event into database: {e}")
 
@@ -921,14 +934,13 @@ class Timeline:
         label: str,
     ) -> None:
         """Updates an existing event in the calendar."""
-        await self.load_events()
-
         # Ensure dtstart and dtend are datetime objects
         if isinstance(start, str):
             start = datetime.datetime.fromisoformat(start)
         if isinstance(end, str):
             end = datetime.datetime.fromisoformat(end)
 
+        start, end = _validate_write_interval(start, end)
         start = dt_util.as_local(start)
         end = dt_util.as_local(end)
 
@@ -954,7 +966,7 @@ class Timeline:
                     ),
                 )
                 await db.commit()
-                await self.load_events()
+                await self.load_events(purge_expired=False)
         except aiosqlite.Error as e:
             _LOGGER.error(f"Error updating event in database: {e}")
 

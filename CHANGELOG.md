@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.7.2.27 - 2026-11-06
+
+### Fixed
+
+- Timeline event defaults use elapsed UTC minutes across daylight-saving changes.
+  New reversed intervals are rejected (zero-duration events remain supported).
+  Calendar refresh and range queries skip invalid historical intervals with a
+  warning, without repairing, rewriting, or deleting stored records. Valid events
+  crossing the repeated hour remain visible; calendar reads do not run retention.
+  Existing lifecycle retention and maintenance are unchanged.
+
 ## 1.7.2.26 - 2026-10-25
 
 ### Fixed

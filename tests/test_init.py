@@ -6,6 +6,7 @@ import datetime
 from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 from homeassistant.exceptions import ServiceValidationError
@@ -28,6 +29,67 @@ from custom_components.llmvision.const import (
     CONF_RETENTION_TIME,
     DOMAIN,
 )
+
+
+@pytest.mark.parametrize(
+    "start",
+    [
+        datetime.datetime(2026, 10, 25, 2, 0, 21, 387204,
+                          tzinfo=ZoneInfo("Europe/Berlin"), fold=1),
+        datetime.datetime(2026, 10, 25, 2, 59, 30,
+                          tzinfo=ZoneInfo("Europe/Berlin")),
+        datetime.datetime(2026, 3, 29, 1, 59, 30,
+                          tzinfo=ZoneInfo("Europe/Berlin")),
+        datetime.datetime(2026, 1, 1, 12),
+    ],
+)
+def test_default_event_end_is_one_elapsed_minute(start):
+    """Omitted ends use elapsed time, including either DST transition."""
+    data = ServiceCallData(_build_data_call({"start_time": start}))
+    expected_start = (
+        start.replace(tzinfo=datetime.timezone.utc)
+        if start.tzinfo is None else start.astimezone(datetime.timezone.utc)
+    )
+    assert data.end_time - expected_start == datetime.timedelta(minutes=1)
+    explicit = expected_start + datetime.timedelta(minutes=5)
+    data = ServiceCallData(
+        _build_data_call({"start_time": start, "end_time": explicit})
+    )
+    assert data.end_time is explicit
+
+
+async def test_producer_end_at_exact_reported_rollback():
+    """Reproduce Python's fold reset and verify the actual producer avoids it."""
+    berlin = ZoneInfo("Europe/Berlin")
+    now = datetime.datetime(2026, 10, 25, 2, 0, 21, 387204,
+                            tzinfo=berlin, fold=1)
+    start = datetime.datetime(2026, 10, 25, 2, 59, 18, 801037, tzinfo=berlin)
+    wrong_end = now + datetime.timedelta(minutes=1)
+    assert wrong_end.fold == 0
+    assert wrong_end.astimezone(datetime.timezone.utc) < start.astimezone(
+        datetime.timezone.utc
+    )
+    hass = _make_hass()
+    hass.config_entries.async_entries.return_value = [
+        SimpleNamespace(data={CONF_PROVIDER: "Settings"})
+    ]
+    timeline = Mock(create_event=AsyncMock())
+    call = ServiceCallData(_build_data_call({"store_in_timeline": True}))
+    with (
+        patch.object(init_module, "Timeline", return_value=timeline),
+        patch.object(init_module.dt_util, "now", return_value=now),
+        patch.object(init_module.dt_util, "utcnow",
+                     return_value=now.astimezone(datetime.timezone.utc)),
+    ):
+        await _create_event(hass, call, start, {}, "")
+    kwargs = timeline.create_event.await_args.kwargs
+    assert kwargs["start"] is start
+    end = kwargs["end"]
+    assert end - now.astimezone(datetime.timezone.utc) == datetime.timedelta(minutes=1)
+    local_end = end.astimezone(berlin)
+    assert local_end.isoformat() == "2026-10-25T02:01:21.387204+01:00"
+    assert local_end.fold == 1
+    assert end > start.astimezone(datetime.timezone.utc)
 
 
 def _build_data_call(data: dict) -> Mock:

@@ -2,6 +2,7 @@ from datetime import datetime
 import asyncio
 from uuid import uuid4
 from .timeline import Timeline
+from .event_times import as_utc
 from .providers import Request
 from .memory import Memory
 from .media_handlers import MediaProcessor
@@ -549,7 +550,7 @@ class ServiceCallData:
         self.start_time: datetime = data_call.data.get("start_time", dt_util.now())
         self.start_time = self._convert_time_input_to_datetime(self.start_time)
         self.end_time: datetime = data_call.data.get(
-            "end_time", self.start_time + timedelta(minutes=1)
+            "end_time", as_utc(self.start_time) + timedelta(minutes=1)
         )
         self.end_time = self._convert_time_input_to_datetime(self.end_time)
         self.image_path: str = data_call.data.get("image_path", "")
@@ -656,7 +657,7 @@ async def _create_event(
 
         await timeline.create_event(
             start=start,
-            end=dt_util.now() + timedelta(minutes=1),
+            end=dt_util.utcnow() + timedelta(minutes=1),
             title=title,
             description=description,
             key_frame=key_frame,

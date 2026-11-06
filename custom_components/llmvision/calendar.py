@@ -8,9 +8,11 @@ from homeassistant.components.calendar.const import CalendarEntityFeature
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.debounce import Debouncer
+from homeassistant.helpers import config_validation as cv
 from homeassistant.config_entries import ConfigEntry
 from .const import SIGNAL_TIMELINE_UPDATED
 from .timeline import Timeline
+from .event_times import as_utc, validate_interval
 import logging
 
 _LOGGER = logging.getLogger(__name__)
@@ -19,6 +21,20 @@ _LOGGER = logging.getLogger(__name__)
 # every refresh reloads the full events DB. Coalesce bursts into a single reload
 # after this quiet period instead of forcing one full reload per event.
 REFRESH_COOLDOWN_SECONDS = 1.5
+
+
+class TimelineCalendarEvent(CalendarEvent):
+    """A non-recurring timed event validated by elapsed, not local-wall time."""
+
+    def __post_init__(self) -> None:
+        # HA's CalendarEvent schema converts to local time before subtracting.
+        # Across rollback this can reject a valid interval even with UTC inputs.
+        # Timeline only emits timed, non-recurring events; retain HA's summary
+        # validation and non-negative duration contract without local subtraction.
+        self.start, self.end = validate_interval(self.start, self.end)
+        cv.string(self.summary)
+        if self.rrule is not None:
+            raise ValueError("Timeline events do not support recurrence")
 
 
 class Calendar(CalendarEntity):
@@ -93,7 +109,7 @@ class Calendar(CalendarEntity):
     def extra_state_attributes(self) -> dict:  # type: ignore
         """Return the state attributes"""
         sorted_events = sorted(
-            self._events, key=lambda event: event.start, reverse=True
+            self._events, key=lambda event: as_utc(event.start), reverse=True
         )
         # Only get most recent event
         event = sorted_events[0] if sorted_events else None
@@ -120,18 +136,18 @@ class Calendar(CalendarEntity):
 
     async def async_update(self) -> None:
         """Loads events from database"""
-        await self.timeline.load_events()
+        await self.timeline.load_events(purge_expired=False)
         events = await self.timeline.get_all_events()
         calendar_events: list[CalendarEvent] = []
         for event in events:
-            if event.start is None or event.end is None:
+            interval = self._event_interval(event)
+            if interval is None:
                 continue
-            event_start = self._ensure_datetime(event.start)
-            event_end = self._ensure_datetime(event.end)
+            event_start, event_end = interval
             key_frame = getattr(event, "key_frame", "") or ""
             camera_name = getattr(event, "camera_name", "") or ""
             calendar_events.append(
-                CalendarEvent(
+                TimelineCalendarEvent(
                     uid=event.uid,
                     summary=event.title,
                     start=event_start,
@@ -141,7 +157,7 @@ class Calendar(CalendarEntity):
                 )
             )
         calendar_events.sort(
-            key=lambda calendar_event: calendar_event.start, reverse=True
+            key=lambda calendar_event: as_utc(calendar_event.start), reverse=True
         )
         self._events = calendar_events
 
@@ -152,23 +168,22 @@ class Calendar(CalendarEntity):
         end_date: datetime.datetime,
     ) -> list[CalendarEvent]:
         """Returns calendar events within a datetime range"""
-        await self.timeline.load_events()
+        await self.timeline.load_events(purge_expired=False)
         timeline_events = await self.timeline.get_all_events()
         calendar_events: list[CalendarEvent] = []
 
         # Ensure start_date and end_date are datetime.datetime objects and timezone-aware
-        start_date = self._ensure_datetime(start_date)
-        end_date = self._ensure_datetime(end_date)
+        start_date = as_utc(start_date)
+        end_date = as_utc(end_date)
 
         for event in timeline_events:
-            if event.start is None or event.end is None:
+            interval = self._event_interval(event)
+            if interval is None:
                 continue
-            # Ensure event.end and event.start are datetime.datetime objects and timezone-aware
-            event_end = self._ensure_datetime(event.end)
-            event_start = self._ensure_datetime(event.start)
+            event_start, event_end = interval
 
             if event_end > start_date and event_start < end_date:
-                calendar_event = CalendarEvent(
+                calendar_event = TimelineCalendarEvent(
                     uid=event.uid,
                     summary=event.title,
                     start=event_start,
@@ -177,6 +192,15 @@ class Calendar(CalendarEntity):
                 )
                 calendar_events.append(calendar_event)
         return calendar_events
+
+    def _event_interval(self, event):
+        """Skip invalid historical intervals without changing the stored event."""
+        try:
+            return validate_interval(event.start, event.end)
+        except ValueError:
+            # Never log model text, camera names, or media paths from the record.
+            _LOGGER.warning("Skipping timeline event with invalid interval")
+            return None
 
     async def async_delete_event(
         self,
