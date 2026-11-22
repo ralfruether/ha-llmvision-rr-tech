@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.7.2.28 - 2026-11-22
+
+### Fixed
+
+- Provider requests are retried up to two times (after 0.5 s and 1 s) when the
+  connection to the provider cannot be established, for example when the server
+  closes the TLS handshake. The request was not sent in that case, so a retry cannot
+  duplicate it. Certificate errors, timeouts and error responses are not retried.
+  Each attempt gets the full request timeout. Retries are logged at INFO level.
+
 ## 1.7.2.27 - 2026-11-06
 
 ### Fixed

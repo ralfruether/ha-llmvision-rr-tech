@@ -1,5 +1,10 @@
 from abc import ABC, abstractmethod
-from aiohttp import ClientTimeout
+from aiohttp import (
+    ClientConnectorCertificateError,
+    ClientConnectorError,
+    ClientTimeout,
+)
+import asyncio
 import boto3
 from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
@@ -68,6 +73,10 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# Pauses before retrying a request whose connection could not be established.
+# Each attempt gets the full request timeout.
+_CONNECT_RETRY_DELAYS = (0.5, 1.0)
 
 
 class Request:
@@ -539,16 +548,29 @@ class Provider(ABC):
         _LOGGER.debug(f"Request data: {Request.sanitize_data(data)}")
         # Sanitize url
         san_url = re.sub(r"\?key=[^&]*", "", url)
-        try:
-            _LOGGER.debug(f"Posting to {san_url}")
-            response = await self.session.post(
-                url,
-                headers=headers,
-                json=data,
-                timeout=ClientTimeout(total=self.request_timeout),
-            )
-        except Exception as e:
-            raise ServiceValidationError(f"Request failed: {e}")
+        attempts = len(_CONNECT_RETRY_DELAYS) + 1
+        for attempt in range(1, attempts + 1):
+            try:
+                _LOGGER.debug(f"Posting to {san_url}")
+                response = await self.session.post(
+                    url,
+                    headers=headers,
+                    json=data,
+                    timeout=ClientTimeout(total=self.request_timeout),
+                )
+                break
+            except ClientConnectorError as e:
+                # The connection failed before the request was sent, so retrying
+                # cannot duplicate it. Certificate errors will not fix themselves.
+                if isinstance(e, ClientConnectorCertificateError) or attempt == attempts:
+                    raise ServiceValidationError(f"Request failed: {e}") from e
+                _LOGGER.info(
+                    f"Connecting to {san_url} failed (attempt {attempt}/{attempts}), "
+                    f"retrying: {e}"
+                )
+                await asyncio.sleep(_CONNECT_RETRY_DELAYS[attempt - 1])
+            except Exception as e:
+                raise ServiceValidationError(f"Request failed: {e}")
 
         if response.status != 200:
             frame = inspect.stack()[1]

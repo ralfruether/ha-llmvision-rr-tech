@@ -1,10 +1,12 @@
 """Comprehensive unit tests for providers.py module."""
 
+import asyncio
 import json
 import pytest
 import base64
 from types import SimpleNamespace
 from unittest.mock import Mock, patch, AsyncMock, MagicMock, call
+from aiohttp import ClientConnectorCertificateError, ClientConnectorError
 from homeassistant.exceptions import ServiceValidationError
 from custom_components.llmvision.providers import (
     Request,
@@ -620,6 +622,80 @@ class TestProviderBase:
 
             assert result["temperature"] == 0.2
             assert result["top_p"] == 0.95
+
+
+class TestPostConnectRetry:
+    """Test that _post retries requests whose connection could not be made."""
+
+    URL = "https://example.openai.azure.com/openai/deployments/x/chat/completions"
+
+    @staticmethod
+    def _connect_error():
+        return ClientConnectorError(Mock(), OSError("handshake closed"))
+
+    @staticmethod
+    def _response(status=200):
+        response = Mock()
+        response.status = status
+        response.json = AsyncMock(return_value={"ok": True})
+        return response
+
+    @pytest.fixture
+    def provider(self, mock_hass):
+        with patch("custom_components.llmvision.providers.async_get_clientsession"):
+            provider = AzureOpenAI(mock_hass, "key", "gpt-4o")
+        provider.session = Mock()
+        provider.session.post = AsyncMock()
+        return provider
+
+    @pytest.fixture(autouse=True)
+    def no_sleep(self):
+        with patch(
+            "custom_components.llmvision.providers.asyncio.sleep", new=AsyncMock()
+        ) as sleep:
+            yield sleep
+
+    async def test_retries_after_connect_error(self, provider, no_sleep):
+        provider.session.post.side_effect = [self._connect_error(), self._response()]
+
+        assert await provider._post(self.URL, {}, {}) == {"ok": True}
+        assert provider.session.post.await_count == 2
+        no_sleep.assert_awaited_once_with(0.5)
+
+    async def test_gives_up_after_three_attempts(self, provider):
+        provider.session.post.side_effect = [self._connect_error() for _ in range(3)]
+
+        with pytest.raises(ServiceValidationError, match="Request failed"):
+            await provider._post(self.URL, {}, {})
+        assert provider.session.post.await_count == 3
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            ClientConnectorCertificateError(Mock(), Exception("bad cert")),
+            asyncio.TimeoutError(),
+        ],
+    )
+    async def test_does_not_retry_other_errors(self, provider, error):
+        provider.session.post.side_effect = error
+
+        with pytest.raises(ServiceValidationError, match="Request failed"):
+            await provider._post(self.URL, {}, {})
+        assert provider.session.post.await_count == 1
+
+    async def test_error_response_after_retry_keeps_provider_message(self, mock_hass):
+        with patch("custom_components.llmvision.providers.async_get_clientsession"):
+            provider = Anthropic(mock_hass, "key", "claude-3")
+        error = self._response(status=529)
+        error.text = AsyncMock(
+            return_value='{"error": {"type": "overloaded_error", "message": "boom"}}'
+        )
+        provider.session = Mock()
+        provider.session.post = AsyncMock(side_effect=[self._connect_error(), error])
+
+        with pytest.raises(ServiceValidationError, match="^overloaded_error: boom$"):
+            await provider._make_request({"messages": []})
+        assert provider.session.post.await_count == 2
 
 
 class TestOpenAI:
